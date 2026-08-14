@@ -1,0 +1,4 @@
+python cfd_zoner.py test_case_1 --variable edr --n-zones 4     # fixed zone count
+python cfd_zoner.py test_case_1 --variable shear               # auto zone count
+python cfd_zoner.py test_case_1 --variable edr --time 8        # manual time point
+python cfd_zoner.py test_case_1 --list-vars                    # show available arrays
