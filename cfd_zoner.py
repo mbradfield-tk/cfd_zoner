@@ -643,6 +643,79 @@ def collect_zone_rows(zone_class: np.ndarray, zone_id: np.ndarray, fluid: np.nda
     return rows
 
 
+def heterogeneity_stats(fld: Field3D, fluid: np.ndarray, zone_class: np.ndarray,
+                        model: ModelInfo, eta2_thr: float, contrast_thr: float) -> dict:
+    """Metrics quantifying whether local values differ significantly from the global mean.
+
+    eta2 (between-zone variance fraction) ~1 means the zones capture real spatial
+    gradients; ~0 means the field is essentially homogeneous. With millions of
+    cells p-values are meaningless, so effect sizes are used instead.
+    """
+    from scipy import ndimage
+
+    v = fld.var[fluid].astype(np.float64)
+    mu = float(v.mean())
+    sd = float(v.std())
+    cv = sd / mu if mu else np.nan
+    pos = v[v > 0]
+    sigma_log10 = float(np.log10(pos).std()) if pos.size else np.nan
+    pct = {f"p{q:02d}": float(np.percentile(v, q)) for q in (5, 25, 50, 75, 95, 99)}
+
+    # variance decomposition: fraction of total variance explained by the zones
+    ss_total = sd ** 2 * v.size
+    ss_between = 0.0
+    zmeans = []
+    for c in np.unique(zone_class):
+        if c < 1:
+            continue
+        zv = fld.var[zone_class == c]
+        zm = float(zv.mean())
+        ss_between += zv.size * (zm - mu) ** 2
+        zmeans.append(zm)
+    eta2 = ss_between / ss_total if ss_total else np.nan
+    contrast = max(zmeans) / min(zmeans) if zmeans and min(zmeans) > 0 else np.nan
+
+    # spatial gradient magnitude on interior fluid cells only: zero-filled solid
+    # neighbours would fake steep gradients at the walls
+    sp = fld.spacing
+    gz, gy, gx = np.gradient(fld.var, sp[2], sp[1], sp[0])
+    gmag = np.sqrt(gx ** 2 + gy ** 2 + gz ** 2)
+    interior = ndimage.binary_erosion(fluid, np.ones((3, 3, 3), bool))
+    g = gmag[interior].astype(np.float64)
+    length = model.impeller_diameter or float(np.max(fld.spacing * np.array(fld.nc)))
+    grad_index = float(g.mean()) * length / mu if g.size and mu else np.nan
+    grad_index_p95 = float(np.percentile(g, 95)) * length / mu if g.size and mu else np.nan
+
+    return {
+        "global_mean": mu, "cv": cv, "sigma_log10": sigma_log10, **pct,
+        "p95_over_p50": pct["p95"] / pct["p50"] if pct["p50"] else np.nan,
+        "p99_over_mean": pct["p99"] / mu if mu else np.nan,
+        "eta2_between_zone": eta2, "zone_contrast": contrast,
+        "grad_index": grad_index, "grad_index_p95": grad_index_p95,
+        "significant_gradients": bool(eta2 >= eta2_thr and contrast >= contrast_thr),
+    }
+
+
+def report_heterogeneity(het: dict, var_name: str, out_csv: Path,
+                         eta2_thr: float, contrast_thr: float) -> None:
+    with open(out_csv, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["metric", "value"])
+        for k, v in het.items():
+            w.writerow([k, v])
+    log(f"wrote {out_csv}")
+
+    verdict = "SIGNIFICANT" if het["significant_gradients"] else "not significant"
+    print(f"\nHeterogeneity of '{var_name}':")
+    print(f"  CV = {het['cv']:.3f}   sigma(log10) = {het['sigma_log10']:.3f}   "
+          f"P95/P50 = {het['p95_over_p50']:.2f}   P99/mean = {het['p99_over_mean']:.2f}")
+    print(f"  between-zone variance fraction eta^2 = {het['eta2_between_zone']:.3f}   "
+          f"zone contrast = {het['zone_contrast']:.2f}   "
+          f"gradient index = {het['grad_index']:.3f}")
+    print(f"  => local-vs-global gradients {verdict} "
+          f"(criteria: eta^2 >= {eta2_thr} and zone contrast >= {contrast_thr})")
+
+
 @dataclass
 class CaseResult:
     """Class-level zoning results of one case/variable, for cross-case comparison."""
@@ -654,6 +727,7 @@ class CaseResult:
     class_means: dict[int, float]
     out_dir: Path                            # holds zones.vti for comparison visuals
     model: ModelInfo
+    het: dict = field(default_factory=dict)  # heterogeneity_stats() output
 
 
 def report(rows: list[tuple[str, int, str, dict]], var_name: str, out_csv: Path) -> None:
@@ -853,6 +927,54 @@ def make_plots(out_dir: Path, fld: Field3D, fluid: np.ndarray, zone_class: np.nd
             plot_pct_slice(img, extent, xl, yl,
                            f"Zone mean as % of global mean ({desc})",
                            f"zone_pct_slice{suf}.png")
+
+    # volume-exposure curve: what fraction of the batch sees <= a given value
+    sv = np.sort(vals.astype(np.float64))
+    idx = np.linspace(0, sv.size - 1, min(4000, sv.size)).astype(int)
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot(sv[idx], 100 * (idx + 1) / sv.size, lw=1.5, color="steelblue")
+    if (sv > 0).any():
+        ax.set_xscale("log")
+    ax.axvline(overall_mean, color="k", ls="--", lw=1,
+               label=f"global mean ({overall_mean:.3g}{unit})")
+    if class_means:
+        for c in sorted(class_means):
+            ax.axvline(class_means[c], color=colors[c], ls=":", lw=1.5,
+                       label=zone_label(c, class_means, unit))
+    ax.set_xlabel(fld.var_name)
+    ax.set_ylabel("cumulative fluid volume [%]")
+    ax.set_title("Volume exposure: fraction of fluid at or below a value")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_dir / "exposure_cdf.png", dpi=150)
+    plt.close(fig)
+
+    # axial & radial profiles: where the gradients sit macroscopically
+    X, Y, Z = fld.cell_centers_3d()
+    up_i = int(np.argmax(u))
+    coords = (X, Y, Z)
+    a = coords[up_i][fluid].astype(np.float64)
+    others = [coords[i][fluid].astype(np.float64) for i in range(3) if i != up_i]
+    r = np.hypot(others[0] - others[0].mean(), others[1] - others[1].mean())
+    vv = fld.var[fluid].astype(np.float64)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
+    for axp, coord, xlab in ((ax1, a, f"{'xyz'[up_i]} [m] (along shaft axis)"),
+                             (ax2, r, "radius from tank axis [m]")):
+        edges = np.linspace(coord.min(), coord.max(), 41)
+        sums, _ = np.histogram(coord, edges, weights=vv)
+        cnts, _ = np.histogram(coord, edges)
+        prof = np.where(cnts > 0, sums / np.maximum(cnts, 1), np.nan)
+        axp.plot((edges[:-1] + edges[1:]) / 2, prof, lw=1.5, color="steelblue")
+        axp.axhline(overall_mean, color="k", ls="--", lw=1, label="global mean")
+        if (vv > 0).any():
+            axp.set_yscale("log")
+        axp.set_xlabel(xlab)
+        axp.set_ylabel(fld.var_name)
+        axp.legend(fontsize=8)
+    fig.suptitle("Volume-averaged profiles")
+    fig.tight_layout()
+    fig.savefig(out_dir / "profiles.png", dpi=150)
+    plt.close(fig)
     log(f"wrote plots to {out_dir}")
 
 
@@ -1037,6 +1159,10 @@ def run_case(case: Case, model: ModelInfo, variable: str, args, out_dir: Path) -
                    for c in np.unique(zone_class) if c >= 1}
     rows = collect_zone_rows(zone_class, zone_id, fluid, fld.var, cell_vol)
     report(rows, fld.var_name, out_dir / "zones.csv")
+    het = heterogeneity_stats(fld, fluid, zone_class, model,
+                              args.eta2_threshold, args.contrast_threshold)
+    report_heterogeneity(het, fld.var_name, out_dir / "heterogeneity.csv",
+                         args.eta2_threshold, args.contrast_threshold)
     write_labeled_vti(fld, zone_class, zone_id, out_dir / "zones.vti")
     if not args.no_plots:
         make_plots(out_dir, fld, fluid, zone_class, bounds, trace, t_steady, t_sel,
@@ -1048,7 +1174,7 @@ def run_case(case: Case, model: ModelInfo, variable: str, args, out_dir: Path) -
                       global_mean=float(fld.var[fluid].mean()),
                       class_rows=[(c, name, s) for level, c, name, s in rows
                                   if level == "class"],
-                      class_means=class_means, out_dir=out_dir, model=model)
+                      class_means=class_means, out_dir=out_dir, model=model, het=het)
 
 
 # ---------------------------------------------------------------- batch comparison
@@ -1123,6 +1249,42 @@ def compare_cases(results: list[CaseResult], out_dir: Path) -> None:
     fig.tight_layout()
     fig.savefig(out_dir / "global_means.png", dpi=150)
     plt.close(fig)
+
+    # heterogeneity indices by case
+    if all(r.het for r in results):
+        keys = list(results[0].het.keys())
+        with open(out_dir / "heterogeneity_by_case.csv", "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["case"] + keys)
+            for r in results:
+                w.writerow([r.case_name] + [r.het.get(k) for k in keys])
+        log(f"wrote {out_dir / 'heterogeneity_by_case.csv'}")
+
+        metrics = [("eta2_between_zone", "between-zone variance fraction (eta^2)"),
+                   ("cv", "coefficient of variation (std/mean)"),
+                   ("zone_contrast", "zone contrast (max/min zone mean)"),
+                   ("grad_index", "normalized gradient index")]
+        names = [r.case_name for r in results]
+        fig, axes = plt.subplots(2, 2, figsize=(max(10.0, 2.5 * n_cases), 8))
+        for axp, (k, title) in zip(axes.ravel(), metrics):
+            axp.bar(names, [r.het.get(k, np.nan) for r in results], color="steelblue")
+            axp.set_title(title, fontsize=10)
+            axp.tick_params(axis="x", rotation=15, labelsize=8)
+        fig.suptitle(f"Heterogeneity indices \u2014 {var_name}")
+        fig.tight_layout()
+        fig.savefig(out_dir / "heterogeneity.png", dpi=150)
+        plt.close(fig)
+
+        print(f"\nHeterogeneity by case for '{var_name}':")
+        hhdr = f"{'case':32} {'eta^2':>8} {'CV':>8} {'contrast':>9} {'grad idx':>9}  verdict"
+        print(hhdr)
+        print("-" * len(hhdr))
+        for r in results:
+            h = r.het
+            verdict = "SIGNIFICANT" if h.get("significant_gradients") else "not significant"
+            print(f"{r.case_name:32} {h.get('eta2_between_zone', np.nan):>8.3f} "
+                  f"{h.get('cv', np.nan):>8.3f} {h.get('zone_contrast', np.nan):>9.2f} "
+                  f"{h.get('grad_index', np.nan):>9.3f}  {verdict}")
     log(f"wrote comparison plots to {out_dir}")
 
     print(f"\nZone mean / case global mean for '{var_name}':")
@@ -1146,43 +1308,69 @@ def load_zone_class(result: CaseResult):
     return grid, zone_class, nc
 
 
-def batch_html_2d(results: list[CaseResult], out_path: Path) -> None:
-    """Single HTML with a grid of 2D side-view zone maps, one subplot per case."""
+def zone_slice_2d(r: CaseResult):
+    """Mid-tank vertical cross-section of ZoneClass: (int image, extent, xlabel, ylabel)."""
+    grid, zone_class, nc = load_zone_class(r)
+    o, sp = np.array(grid.origin), np.array(grid.spacing)
+    xc, yc, zc = (o[j] + (np.arange(nc[j]) + 0.5) * sp[j] for j in range(3))
+    u = (np.abs(r.model.impeller_axis) if r.model.impeller_axis is not None
+         else np.array([0.0, 1.0, 0.0]))
+    if u[2] < 0.9:  # vertical cross-section containing the rotation axis
+        img = zone_class[nc[2] // 2, :, :]
+        extent = [xc[0], xc[-1], yc[0], yc[-1]]
+        xl, yl = "x [m]", "y [m]"
+    else:
+        img = zone_class[:, nc[1] // 2, :]
+        extent = [xc[0], xc[-1], zc[0], zc[-1]]
+        xl, yl = "x [m]", "z [m]"
+    return img, extent, xl, yl
+
+
+def fig_to_html(fig, title: str, out_path: Path) -> None:
+    """Save a matplotlib figure as a self-contained HTML page."""
     import base64
     import io
+    import matplotlib.pyplot as plt
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    out_path.write_text(
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<title>{title}</title></head>"
+        "<body style='margin:0;background:#fff'>"
+        f"<img style='width:100%' src='data:image/png;base64,{b64}'/></body></html>")
+    log(f"wrote {out_path}")
+
+
+def _case_grid(n: int):
+    ncols = min(3, n)
+    return ncols, -(-n // ncols)
+
+
+def batch_html_2d(results: list[CaseResult], out_path: Path) -> None:
+    """Single HTML with a grid of 2D side-view zone maps, one subplot per case."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import ListedColormap
 
     n = len(results)
-    ncols = min(3, n)
-    nrows = -(-n // ncols)
+    ncols, nrows = _case_grid(n)
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5.5 * nrows), squeeze=False)
     for ax in axes.ravel()[n:]:
         ax.axis("off")
     for i, r in enumerate(results):
         ax = axes.ravel()[i]
-        grid, zone_class, nc = load_zone_class(r)
-        o, sp = np.array(grid.origin), np.array(grid.spacing)
-        xc, yc, zc = (o[j] + (np.arange(nc[j]) + 0.5) * sp[j] for j in range(3))
-        u = (np.abs(r.model.impeller_axis) if r.model.impeller_axis is not None
-             else np.array([0.0, 1.0, 0.0]))
-        if u[2] < 0.9:  # vertical cross-section containing the rotation axis
-            img = zone_class[nc[2] // 2, :, :]
-            extent = [xc[0], xc[-1], yc[0], yc[-1]]
-            xl, yl = "x [m]", "y [m]"
-        else:
-            img = zone_class[:, nc[1] // 2, :]
-            extent = [xc[0], xc[-1], zc[0], zc[-1]]
-            xl, yl = "x [m]", "z [m]"
-        img = img.astype(float)
-        img[img < 1] = np.nan
+        img, extent, xl, yl = zone_slice_2d(r)
+        imgf = img.astype(float)
+        imgf[imgf < 1] = np.nan
         n_classes = max(r.class_means)
         colors = zone_colors(r.class_means)
         cmap = ListedColormap([colors.get(c, (0.5, 0.5, 0.5, 1.0))
                                for c in range(1, n_classes + 1)])
-        im = ax.imshow(img, origin="lower", extent=extent, cmap=cmap,
+        im = ax.imshow(imgf, origin="lower", extent=extent, cmap=cmap,
                        vmin=0.5, vmax=n_classes + 0.5, interpolation="nearest")
         unit = var_unit(r.var_name)
         cbar = fig.colorbar(im, ax=ax, ticks=range(1, n_classes + 1),
@@ -1195,15 +1383,124 @@ def batch_html_2d(results: list[CaseResult], out_path: Path) -> None:
         ax.set_title(r.case_name, fontsize=11)
     fig.suptitle(f"Zone maps by case \u2014 {results[0].var_name}", fontsize=13)
     fig.tight_layout()
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150)
+    fig_to_html(fig, f"Zone maps \u2014 {results[0].var_name}", out_path)
+
+
+def batch_html_2d_common(results: list[CaseResult], out_path: Path) -> None:
+    """Zone maps on one shared color scale: zones with the same mean get the same
+    color across cases, so differences between cases are directly visible."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+
+    var_name = results[0].var_name
+    unit = var_unit(var_name)
+    # shared discrete scale over the unique zone-mean values of all cases
+    key = lambda m: float(f"{m:.3g}")
+    uniq = sorted({key(m) for r in results for m in r.class_means.values()})
+    val_colors = zone_colors(dict(enumerate(uniq)))
+    color_of = {v: val_colors[i] for i, v in enumerate(uniq)}
+
+    n = len(results)
+    ncols, nrows = _case_grid(n)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols + 2.0, 5.5 * nrows),
+                             squeeze=False)
+    for ax in axes.ravel()[n:]:
+        ax.axis("off")
+    for i, r in enumerate(results):
+        ax = axes.ravel()[i]
+        img, extent, xl, yl = zone_slice_2d(r)
+        imgf = img.astype(float)
+        imgf[imgf < 1] = np.nan
+        n_classes = max(r.class_means)
+        cmap = ListedColormap([color_of.get(key(r.class_means[c]), (0.5, 0.5, 0.5, 1.0))
+                               if c in r.class_means else (0.5, 0.5, 0.5, 1.0)
+                               for c in range(1, n_classes + 1)])
+        ax.imshow(imgf, origin="lower", extent=extent, cmap=cmap,
+                  vmin=0.5, vmax=n_classes + 0.5, interpolation="nearest")
+        ax.set_xlabel(xl)
+        ax.set_ylabel(yl)
+        ax.set_aspect("equal")
+        ax.set_title(r.case_name, fontsize=11)
+    # one shared colorbar over the pooled zone-mean values
+    sm = plt.cm.ScalarMappable(
+        cmap=ListedColormap([color_of[v] for v in uniq]),
+        norm=BoundaryNorm(np.arange(len(uniq) + 1), len(uniq)))
+    cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), fraction=0.05, pad=0.02,
+                        ticks=np.arange(len(uniq)) + 0.5)
+    cbar.ax.set_yticklabels([f"{v:.3g}{unit}" for v in uniq], fontsize=8)
+    cbar.set_label(f"zone mean {var_name}")
+    fig.suptitle(f"Zone maps on a common color scale \u2014 {var_name}", fontsize=13)
+    fig_to_html(fig, f"Zone maps (common scale) \u2014 {var_name}", out_path)
+
+
+def batch_html_2d_normalized(results: list[CaseResult], out_path: Path) -> None:
+    """Zone maps colored by zone mean on a continuous scale normalized to the
+    lowest/highest zone mean across all cases."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm, Normalize
+
+    var_name = results[0].var_name
+    all_means = [m for r in results for m in r.class_means.values()]
+    vmin, vmax = min(all_means), max(all_means)
+    norm = LogNorm(vmin, vmax) if vmin > 0 else Normalize(vmin, vmax)
+
+    n = len(results)
+    ncols, nrows = _case_grid(n)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols + 1.5, 5.5 * nrows),
+                             squeeze=False)
+    for ax in axes.ravel()[n:]:
+        ax.axis("off")
+    im = None
+    for i, r in enumerate(results):
+        ax = axes.ravel()[i]
+        img, extent, xl, yl = zone_slice_2d(r)
+        lut = np.full(max(r.class_means) + 1, np.nan)
+        for c, m in r.class_means.items():
+            lut[c] = m
+        vals = np.where(img >= 1, lut[np.clip(img, 0, len(lut) - 1)], np.nan)
+        im = ax.imshow(vals, origin="lower", extent=extent, cmap="turbo", norm=norm,
+                       interpolation="nearest")
+        ax.set_xlabel(xl)
+        ax.set_ylabel(yl)
+        ax.set_aspect("equal")
+        ax.set_title(r.case_name, fontsize=11)
+    cbar = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.04, pad=0.02)
+    cbar.set_label(f"zone mean {var_name}")
+    fig.suptitle(f"Zone means on a continuous scale "
+                 f"({vmin:.3g} .. {vmax:.3g}) \u2014 {var_name}", fontsize=13)
+    fig_to_html(fig, f"Zone means (normalized) \u2014 {var_name}", out_path)
+
+
+def batch_exposure_cdf(results: list[CaseResult], out_path: Path) -> None:
+    """Combined volume-exposure curves of all cases (values reloaded from zones.vti)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    any_pos = False
+    for r in results:
+        grid, zone_class, _ = load_zone_class(r)
+        var = np.asarray(grid.cell_data[r.var_name]).reshape(zone_class.shape)
+        v = np.sort(var[zone_class > 0].astype(np.float64))
+        if (v > 0).any():
+            any_pos = True
+        idx = np.linspace(0, v.size - 1, min(4000, v.size)).astype(int)
+        line, = ax.plot(v[idx], 100 * (idx + 1) / v.size, lw=1.5, label=r.case_name)
+        ax.axvline(r.global_mean, color=line.get_color(), ls="--", lw=1)
+    if any_pos:
+        ax.set_xscale("log")
+    ax.set_xlabel(results[0].var_name)
+    ax.set_ylabel("cumulative fluid volume [%]")
+    ax.set_title("Volume exposure by case (dashed: case global means)")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
     plt.close(fig)
-    b64 = base64.b64encode(buf.getvalue()).decode()
-    out_path.write_text(
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        f"<title>Zone maps \u2014 {results[0].var_name}</title></head>"
-        "<body style='margin:0;background:#fff'>"
-        f"<img style='width:100%' src='data:image/png;base64,{b64}'/></body></html>")
     log(f"wrote {out_path}")
 
 
@@ -1312,6 +1609,9 @@ def run_batch(args) -> None:
         comp_dir = case_out_dir(comp_base, args.variable, v)
         compare_cases(results[v], comp_dir)
         batch_html_2d(results[v], comp_dir / "zones_2d.html")
+        batch_html_2d_common(results[v], comp_dir / "zones_2d_common.html")
+        batch_html_2d_normalized(results[v], comp_dir / "zones_2d_normalized.html")
+        batch_exposure_cdf(results[v], comp_dir / "exposure_cdf.png")
         batch_html_3d(results[v], comp_dir / "zones_3d.html")
 
 
@@ -1342,6 +1642,12 @@ def main(argv=None):
     ap.add_argument("--linear", action="store_true", help="cluster on linear values, not log10")
     ap.add_argument("--min-zone-frac", type=float, default=0.005,
                     help="min sub-zone size as fraction of fluid volume")
+    ap.add_argument("--eta2-threshold", type=float, default=0.5,
+                    help="between-zone variance fraction above which gradients "
+                         "are flagged significant")
+    ap.add_argument("--contrast-threshold", type=float, default=3.0,
+                    help="zone contrast (max/min zone mean) above which gradients "
+                         "are flagged significant")
     ap.add_argument("--impeller-pad", type=float, default=0.15,
                     help="impeller cylinder padding fraction")
     ap.add_argument("--impeller-percentile", type=float, default=99.0,

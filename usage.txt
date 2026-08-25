@@ -46,6 +46,10 @@ Options
 --linear                  cluster on linear values instead of log10
 --min-zone-frac F         min sub-zone size as fraction of fluid volume;
                           smaller fragments are merged (default: 0.005)
+--eta2-threshold T        between-zone variance fraction (eta^2) above which
+                          gradients are flagged significant (default: 0.5)
+--contrast-threshold T    zone contrast (max/min zone mean) above which
+                          gradients are flagged significant (default: 3.0)
 --impeller-pad P          impeller cylinder padding fraction (default: 0.15)
 --impeller-percentile P   velocity percentile for fallback impeller detection
                           when no impeller STL/axis is available (default: 99.0)
@@ -65,9 +69,13 @@ Options
 Outputs (written to the output directory)
 -----------------------------------------
 zones.csv                 per-zone and per-sub-zone statistics
+heterogeneity.csv         local-vs-global significance metrics (see below)
 zones.vti                 labeled grid (ZoneClass, ZoneID) for ParaView
 time_trace.png            stats trace with steady-state and analysis markers
 histogram.png             value distribution with class boundaries and means
+exposure_cdf.png          cumulative fluid volume vs. value ("what fraction of
+                          the batch sees <= X?") with global/zone mean markers
+profiles.png              volume-averaged axial and radial profiles
 zone_weights.png          zone volume fractions vs. contribution to the mean
 zone_slice*.png           zone maps (side, side2, top views)
 zone_pct_slice*.png       zone mean as % of global mean (same views)
@@ -80,14 +88,61 @@ Batch outputs (written to <root>/zoner_comparison/)
 ---------------------------------------------------
 comparison.csv            case x zone stats with case global mean and
                           zone-mean / global-mean ratio
+heterogeneity_by_case.csv all heterogeneity metrics per case
+heterogeneity.png         eta^2, CV, zone contrast, gradient index by case
 zone_means.png            absolute zone means by case (log scale)
 zone_ratios.png           zone mean / case global mean (1.0 = case average)
 zone_volfrac.png          zone volume fractions by case
 global_means.png          case global fluid means
-zones_2d.html             2D zone maps, one subplot per case (self-contained)
+zones_2d.html             2D zone maps, one subplot per case (self-contained,
+                          per-case rank colors)
+zones_2d_common.html      2D zone maps on one shared discrete color scale:
+                          zones with the same mean get the same color, so
+                          differences across cases are directly visible
+zones_2d_normalized.html  2D maps of zone means on a continuous (log) color
+                          scale spanning the lowest..highest zone mean across
+                          all cases
+exposure_cdf.png          combined volume-exposure curves of all cases
+                          (dashed lines: case global means)
 zones_3d.html             interactive 3D zone views, one subplot per case
                           (linked cameras: rotate one, all follow)
 
 Zones are clustered per case; the comparison aligns them by rank
 (class 1 = highest values in each case). Pass --n-zones in batch mode so
 every case has the same zone count.
+
+Interpreting the heterogeneity metrics (heterogeneity.csv)
+----------------------------------------------------------
+These answer "are there significant local-vs-global differences (gradients)
+in the chosen variable?". With millions of cells classic p-values are
+meaningless, so effect sizes are reported instead:
+
+eta2_between_zone         fraction of total variance explained by the zones
+                          (ANOVA eta^2). ~1: zones capture real, spatially
+                          coherent gradients; ~0: field is essentially
+                          homogeneous and the zoning is arbitrary.
+zone_contrast             highest zone mean / lowest zone mean. 1 = uniform;
+                          >~3 means order-of-magnitude local differences.
+cv                        coefficient of variation (std/mean) over fluid cells;
+                          classic mixing homogeneity measure (0 = homogeneous).
+sigma_log10               spread of log10(values); robust for variables that
+                          span decades (EDR, shear).
+p05..p99                  volume-weighted percentiles of the variable.
+p95_over_p50, p99_over_mean
+                          "peakiness": how extreme the top of the distribution
+                          is relative to the bulk.
+grad_index                mean |grad(var)| * L / mean(var), L = impeller
+                          diameter; dimensionless spatial gradient magnitude,
+                          comparable across scales/rpm. grad_index_p95 is the
+                          95th-percentile equivalent (steep fronts).
+significant_gradients     True when eta2 >= --eta2-threshold AND
+                          zone_contrast >= --contrast-threshold; the same
+                          verdict is printed to the console per case.
+
+Rules of thumb: eta^2 > 0.5 with contrast > 3 indicates process-relevant
+gradients (e.g. shear-sensitive material cycling through a hot impeller
+zone). Low eta^2 with high CV means variability exists but is spatially
+fine-grained rather than organized into distinct regions. Use
+exposure_cdf.png to translate this into batch exposure ("x% of the volume
+experiences > y"), and profiles.png to locate the gradients (impeller
+discharge vs. top-to-bottom stratification).
