@@ -1,4 +1,67 @@
-python cfd_zoner.py test_case_1 --variable edr --n-zones 4     # fixed zone count
-python cfd_zoner.py test_case_1 --variable shear               # auto zone count
-python cfd_zoner.py test_case_1 --variable edr --time 8        # manual time point
-python cfd_zoner.py test_case_1 --list-vars                    # show available arrays
+cfd_zoner.py — zonal analysis of M-Star CFD volume (VTI) output
+
+Expected case layout (M-Star native results directory):
+    case/input.xml
+    case/*.stl
+    case/out/Stats/*.txt
+    case/out/Output/Volume.pvd
+    case/out/Output/Volume/block0/*.vti
+    case/zoner_output/            (created by the tool)
+
+Examples
+--------
+python cfd_zoner.py <case_dir> --variable edr --n-zones 4   # fixed zone count
+python cfd_zoner.py <case_dir> --variable shear             # auto zone count
+python cfd_zoner.py <case_dir> --variable edr --time 8      # manual time point
+python cfd_zoner.py <case_dir> --list-vars                  # show available arrays
+python cfd_zoner.py <case_dir> --html --no-plots            # interactive 3D HTML only
+
+Positional argument
+-------------------
+case                      M-Star case directory (or a single .vti file)
+
+Options
+-------
+-h, --help                show help message and exit
+--variable VARIABLE       variable to analyze, fuzzy match (default: edr)
+                          aliases: edr, tke, velocity, shear, tracer,
+                          kolmogorov, micromixing
+--n-zones N               total zones incl. impeller; omit for automatic
+                          selection via silhouette score (default: auto)
+--time T                  analysis time [s]; overrides steady-state detection
+--steady-on {variable,power}
+                          steady-state criterion source (default: variable)
+--tol TOL                 steady-state tolerance on windowed-mean drift
+                          (default: 0.02)
+--window W                steady-state window [s] (default: 1.0)
+--instantaneous           use instantaneous field even if a Time-Avg variant
+                          exists (default: use Time-Avg when available)
+--linear                  cluster on linear values instead of log10
+--min-zone-frac F         min sub-zone size as fraction of fluid volume;
+                          smaller fragments are merged (default: 0.005)
+--impeller-pad P          impeller cylinder padding fraction (default: 0.15)
+--impeller-percentile P   velocity percentile for fallback impeller detection
+                          when no impeller STL/axis is available (default: 99.0)
+--impeller-shape {cylinder,blob}
+                          fallback impeller zone shape (default: cylinder)
+--no-impeller-zone        skip the geometric impeller zone; all n_zones come
+                          from clustering
+--output-dir DIR          output directory (default: <case>/zoner_output)
+--list-vars               list VTI arrays and exit
+--no-plots                skip diagnostic plots
+--no-render               skip 3D rendering
+--show                    open interactive 3D window
+--html                    export interactive 3D HTML (zones_3d.html) and a
+                          binary glTF model (zones_3d.glb) for PowerPoint
+
+Outputs (written to the output directory)
+-----------------------------------------
+zones.csv                 per-zone and per-sub-zone statistics
+zones.vti                 labeled grid (ZoneClass, ZoneID) for ParaView
+time_trace.png            stats trace with steady-state and analysis markers
+histogram.png             value distribution with class boundaries and means
+zone_weights.png          zone volume fractions vs. contribution to the mean
+zone_slice*.png           zone maps (side, side2, top views)
+zone_pct_slice*.png       zone mean as % of global mean (same views)
+zones_3d.png / .html      3D rendering (cutaway) of the zones
+zones_3d.glb              3D model (insert into PowerPoint via Insert > 3D Models)

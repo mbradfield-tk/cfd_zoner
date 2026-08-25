@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Zonal analysis of M-Star CFD volume (VTI) output.
 
-Reads an M-Star case directory (input.xml, Stats/, STL/, VTI volume series),
+Reads an M-Star results directory in its native layout (case/input.xml,
+case/*.stl, case/out/Stats/, case/out/Output/Volume/block*/*.vti),
 finds momentum steady state (or uses a user-defined time), always defines an
 impeller zone, clusters the selected variable into value-based zones (log-scale
 k-means) split into spatially contiguous sub-zones, and reports per-zone stats,
@@ -66,7 +67,9 @@ def zone_colors(class_means: dict[int, float]) -> dict[int, tuple]:
 
     order = sorted(class_means, key=lambda c: class_means[c])
     n = len(order)
-    return {c: plt.cm.turbo(0.05 + 0.9 * i / max(n - 1, 1)) for i, c in enumerate(order)}
+    dim = 0.75  # darken for better contrast, esp. in 3D exports
+    return {c: tuple(dim * v for v in plt.cm.turbo(0.05 + 0.9 * i / max(n - 1, 1))[:3]) + (1.0,)
+            for i, c in enumerate(order)}
 
 
 def log(msg: str) -> None:
@@ -96,8 +99,61 @@ class Case:
 # M-Star encodes sim time in the filename, e.g. Volume.5.00000e+00.vti
 TIME_RE = re.compile(r"\.([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?)$", re.IGNORECASE)
 
+# directories the tool writes itself (never treated as simulation input)
+SKIP_DIRS = {"zoner_output"}
+
+
+def _rglob(root: Path, pattern: str) -> list[Path]:
+    return sorted(f for f in root.rglob(pattern)
+                  if not SKIP_DIRS.intersection(f.parts))
+
+
+def read_pvd_times(pvd: Path) -> dict[Path, float]:
+    """Map VTI paths to timesteps from a ParaView collection (.pvd) file."""
+    import xml.etree.ElementTree as ET
+
+    times: dict[Path, float] = {}
+    try:
+        for ds in ET.parse(pvd).getroot().iter("DataSet"):
+            f, t = ds.get("file"), ds.get("timestep")
+            if f and t:
+                times[(pvd.parent / f).resolve()] = float(t)
+    except Exception as e:
+        warn(f"could not parse {pvd.name}: {e}")
+    return times
+
+
+def build_vti_series(vti_files: list[Path], pvd_files: list[Path]) -> list[tuple[float, Path]]:
+    pvd_times: dict[Path, float] = {}
+    for pvd in pvd_files:
+        pvd_times.update(read_pvd_times(pvd))
+
+    series = []
+    unparsed = []
+    for f in vti_files:
+        m = TIME_RE.search(f.stem)
+        if m:
+            series.append((float(m.group(1)), f))
+        elif f.resolve() in pvd_times:
+            series.append((pvd_times[f.resolve()], f))
+        else:
+            unparsed.append(f)
+    if series and unparsed:
+        warn(f"ignoring {len(unparsed)} VTI file(s) without a resolvable time "
+             f"(e.g. {unparsed[0].name})")
+    elif not series and unparsed:
+        warn("no VTI timesteps resolvable from filenames or .pvd; using file order")
+        series = [(float(i), f) for i, f in enumerate(unparsed)]
+    return sorted(series, key=lambda x: x[0])
+
 
 def discover_case(root: Path) -> Case:
+    """Discover case files, preferring M-Star's native layout:
+
+    case/input.xml, case/*.stl, case/out/Stats/*.txt,
+    case/out/Output/Volume/block*/*.vti (+ case/out/Output/*.pvd),
+    with a recursive fallback for non-standard layouts.
+    """
     case = Case(root=root)
     if root.is_file() and root.suffix == ".vti":
         case.vti_series = [(0.0, root)]
@@ -105,30 +161,34 @@ def discover_case(root: Path) -> Case:
     if not root.is_dir():
         fail(f"case path not found: {root}")
 
-    hits = sorted(root.rglob("input.xml"))
+    xml = root / "input.xml"
+    hits = [xml] if xml.is_file() else _rglob(root, "input.xml")
     case.input_xml = hits[0] if hits else None
 
-    series = []
-    unparsed = []
-    for f in sorted(root.rglob("*.vti")):
-        m = TIME_RE.search(f.stem)
-        if m:
-            series.append((float(m.group(1)), f))
-        else:
-            unparsed.append(f)
-    if series and unparsed:
-        warn(f"ignoring {len(unparsed)} VTI file(s) without a time-encoded name "
-             f"(e.g. {unparsed[0].name})")
-    elif not series and unparsed:
-        warn("no VTI filenames carry a parsable time; using file order")
-        series = [(float(i), f) for i, f in enumerate(unparsed)]
-    case.vti_series = sorted(series, key=lambda x: x[0])
+    # volume VTI series: restrict to the Volume output tree when present, so
+    # slice/checkpoint VTIs in a full M-Star results directory are not swept in
+    volume_dir = root / "out" / "Output" / "Volume"
+    if volume_dir.is_dir():
+        blocks = sorted(d for d in volume_dir.iterdir()
+                        if d.is_dir() and d.name.startswith("block"))
+        if len(blocks) > 1:
+            warn(f"multiple volume blocks ({', '.join(b.name for b in blocks)}); "
+                 f"using {blocks[0].name} only")
+        vti_files = sorted((blocks[0] if blocks else volume_dir).glob("*.vti"))
+        pvd_files = sorted(volume_dir.parent.glob("*.pvd"))
+    else:
+        vti_files = _rglob(root, "*.vti")
+        pvd_files = _rglob(root, "*.pvd")
+    case.vti_series = build_vti_series(vti_files, pvd_files)
 
-    fluid = sorted(root.rglob("Fluid.txt"))
+    stats_dir = root / "out" / "Stats"
+    stats_root = stats_dir if stats_dir.is_dir() else root
+    fluid = sorted(stats_root.glob("Fluid.txt")) or _rglob(root, "Fluid.txt")
     case.stats_fluid = fluid[0] if fluid else None
-    power = sorted(root.rglob("MovingBody_*.txt"))
+    power = sorted(stats_root.glob("MovingBody_*.txt")) or _rglob(root, "MovingBody_*.txt")
     case.stats_power = power[0] if power else None
-    case.stl_files = sorted(root.rglob("*.stl"))
+
+    case.stl_files = sorted(root.glob("*.stl")) or _rglob(root, "*.stl")
     return case
 
 
@@ -774,6 +834,78 @@ def make_plots(out_dir: Path, fld: Field3D, fluid: np.ndarray, zone_class: np.nd
     log(f"wrote plots to {out_dir}")
 
 
+def export_glb(pl, out_path: Path, up: np.ndarray | None = None) -> None:
+    """Write a binary glTF (.glb) with the model's up axis mapped to glTF +Y.
+
+    VTK's exporter only emits JSON .gltf and bakes in a Z-up assumption, which
+    misorients Y-up tanks (wrong turntable axis in PowerPoint).
+    """
+    import base64
+    import json
+    import struct
+    import tempfile
+
+    # rotation taking the scene up-vector onto glTF's +Y (Rodrigues)
+    u = np.array([0.0, 1.0, 0.0]) if up is None else np.asarray(up, float)
+    u = u / np.linalg.norm(u)
+    y = np.array([0.0, 1.0, 0.0])
+    v, c = np.cross(u, y), float(u @ y)
+    s = float(np.linalg.norm(v))
+    if s < 1e-12:
+        rot = np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+    else:
+        k = v / s
+        K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+        rot = np.eye(3) + s * K + (1 - c) * (K @ K)
+    m = np.eye(4)
+    m[:3, :3] = rot
+    node_matrix = m.T.ravel().tolist()  # glTF matrices are column-major
+
+    with tempfile.TemporaryDirectory() as td:
+        gltf = Path(td) / "scene.gltf"
+        pl.export_gltf(str(gltf), inline_data=True)
+        doc = json.loads(gltf.read_text())
+        blob = bytearray()
+        offsets = []
+        for buf in doc.get("buffers", []):
+            blob += b"\0" * ((-len(blob)) % 4)  # glTF requires 4-byte alignment
+            offsets.append(len(blob))
+            uri = buf.get("uri", "")
+            if uri.startswith("data:"):
+                blob += base64.b64decode(uri.split(",", 1)[1])
+            elif uri:
+                blob += (gltf.parent / uri).read_bytes()
+
+    for bv in doc.get("bufferViews", []):
+        bv["byteOffset"] = bv.get("byteOffset", 0) + offsets[bv.get("buffer", 0)]
+        bv["buffer"] = 0
+    doc["buffers"] = [{"byteLength": len(blob)}]
+
+    # override the exporter's per-mesh transforms and drop the camera node
+    doc.pop("cameras", None)
+    for node in doc.get("nodes", []):
+        node.pop("camera", None)
+        if "mesh" in node:
+            node["matrix"] = node_matrix
+        elif "children" not in node:
+            node.pop("matrix", None)
+
+    # glTF defaults to alphaMode OPAQUE, which ignores baseColorFactor alpha
+    for mat in doc.get("materials", []):
+        rgba = mat.get("pbrMetallicRoughness", {}).get("baseColorFactor")
+        if rgba and len(rgba) == 4 and rgba[3] < 1.0:
+            mat["alphaMode"] = "BLEND"
+            mat["doubleSided"] = True
+
+    js = json.dumps(doc, separators=(",", ":")).encode()
+    js += b" " * ((-len(js)) % 4)
+    blob += b"\0" * ((-len(blob)) % 4)
+    with open(out_path, "wb") as fh:
+        fh.write(struct.pack("<III", 0x46546C67, 2, 12 + 8 + len(js) + 8 + len(blob)))
+        fh.write(struct.pack("<II", len(js), 0x4E4F534A) + js)
+        fh.write(struct.pack("<II", len(blob), 0x004E4942) + blob)
+
+
 def render_3d(out_dir: Path, fld: Field3D, zone_class: np.ndarray, model: ModelInfo,
               show: bool, html: bool, cutaway: bool = True,
               class_means: dict[int, float] | None = None) -> None:
@@ -817,6 +949,9 @@ def render_3d(out_dir: Path, fld: Field3D, zone_class: np.ndarray, model: ModelI
         if html:
             pl.export_html(str(out_dir / "zones_3d.html"))
             log(f"wrote {out_dir / 'zones_3d.html'}")
+            # binary glTF: insertable into PowerPoint as a 3D model
+            export_glb(pl, out_dir / "zones_3d.glb", up=np.array(up, float))
+            log(f"wrote {out_dir / 'zones_3d.glb'}")
         if show:
             pl.show(screenshot=str(out_dir / "zones_3d.png"))
         else:
@@ -859,10 +994,11 @@ def main(argv=None):
     ap.add_argument("--output-dir", type=Path, default=None,
                     help="output directory (default: <case>/zoner_output)")
     ap.add_argument("--list-vars", action="store_true", help="list VTI arrays and exit")
-    ap.add_argument("--no-plots", action="store_true")
-    ap.add_argument("--no-render", action="store_true")
+    ap.add_argument("--no-plots", action="store_true", help="skip diagnostic plots")
+    ap.add_argument("--no-render", action="store_true", help="skip 3D rendering")
     ap.add_argument("--show", action="store_true", help="open interactive 3D window")
-    ap.add_argument("--html", action="store_true", help="export interactive 3D HTML")
+    ap.add_argument("--html", action="store_true",
+                    help="export interactive 3D HTML and a .glb 3D model (for PowerPoint)")
     args = ap.parse_args(argv)
 
     global HAS_IMPELLER
