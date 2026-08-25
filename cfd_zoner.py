@@ -10,6 +10,7 @@ a labeled VTI for ParaView, diagnostic plots, and a 3D rendering.
 
 Example:
     python cfd_zoner.py test_case_1 --variable edr --n-zones 4
+    python cfd_zoner.py sim_root --batch --variable edr shear --n-zones 4
 """
 
 from __future__ import annotations
@@ -72,6 +73,10 @@ def zone_colors(class_means: dict[int, float]) -> dict[int, tuple]:
             for i, c in enumerate(order)}
 
 
+def var_slug(v: str) -> str:
+    return re.sub(r"\W+", "_", v.strip().lower()).strip("_") or "var"
+
+
 def log(msg: str) -> None:
     print(f"[cfd_zoner] {msg}")
 
@@ -100,7 +105,7 @@ class Case:
 TIME_RE = re.compile(r"\.([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?)$", re.IGNORECASE)
 
 # directories the tool writes itself (never treated as simulation input)
-SKIP_DIRS = {"zoner_output"}
+SKIP_DIRS = {"zoner_output", "zoner_comparison"}
 
 
 def _rglob(root: Path, pattern: str) -> list[Path]:
@@ -619,8 +624,9 @@ def zone_summary(mask: np.ndarray, var: np.ndarray, cell_vol: float, n_fluid: in
     }
 
 
-def report(zone_class: np.ndarray, zone_id: np.ndarray, fluid: np.ndarray,
-           var: np.ndarray, var_name: str, cell_vol: float, out_csv: Path) -> None:
+def collect_zone_rows(zone_class: np.ndarray, zone_id: np.ndarray, fluid: np.ndarray,
+                      var: np.ndarray, cell_vol: float) -> list[tuple[str, int, str, dict]]:
+    """Per-class and per-subzone stats rows: (level, id, label, summary)."""
     n_fluid = int(np.count_nonzero(fluid))
     rows = []
     for c in np.unique(zone_class):
@@ -634,7 +640,23 @@ def report(zone_class: np.ndarray, zone_id: np.ndarray, fluid: np.ndarray,
         c = int(zone_class[zone_id == z][0])
         name = zone_label(c)
         rows.append(("subzone", int(z), name, zone_summary(zone_id == z, var, cell_vol, n_fluid)))
+    return rows
 
+
+@dataclass
+class CaseResult:
+    """Class-level zoning results of one case/variable, for cross-case comparison."""
+    case_name: str
+    var_name: str
+    t_sel: float
+    global_mean: float
+    class_rows: list[tuple[int, str, dict]]  # (class id, zone label, stats summary)
+    class_means: dict[int, float]
+    out_dir: Path                            # holds zones.vti for comparison visuals
+    model: ModelInfo
+
+
+def report(rows: list[tuple[str, int, str, dict]], var_name: str, out_csv: Path) -> None:
     hdr = f"{'level':8} {'id':>3} {'zone':12} {'cells':>10} {'vol [m3]':>12} {'vol %':>7} " \
           f"{'mean':>12} {'std':>12} {'min':>12} {'max':>12}"
     print(f"\nZonal statistics for '{var_name}':")
@@ -961,14 +983,351 @@ def render_3d(out_dir: Path, fld: Field3D, zone_class: np.ndarray, model: ModelI
         warn(f"3D rendering failed ({e}); labeled VTI can be viewed in ParaView instead")
 
 
+# ---------------------------------------------------------------- pipeline
+
+def run_case(case: Case, model: ModelInfo, variable: str, args, out_dir: Path) -> CaseResult:
+    """Full zoning/analysis pipeline for one case and one variable."""
+    trace = steady_trace_from_stats(case, variable, args.steady_on)
+    t_steady = None
+    if args.time is not None:
+        t_target = args.time
+        log(f"user-defined analysis time: {t_target} s")
+    else:
+        if trace is None:
+            warn("no stats trace available; using last VTI timestep")
+            t_target = case.vti_series[-1][0]
+        else:
+            t_steady = detect_steady_state(trace[0], trace[1], args.window, args.tol)
+            t_target = t_steady
+            log(f"steady state detected at t = {t_steady:.3f} s")
+    later = [(t, f) for t, f in case.vti_series if t >= t_target - 1e-9]
+    t_sel, vti_path = later[0] if later else case.vti_series[-1]
+    log(f"analysis timestep: t = {t_sel:.3g} s ({vti_path.name})")
+
+    # --- load field & masks
+    fld = load_field(vti_path, variable, prefer_time_avg=not args.instantaneous)
+    fluid = build_fluid_mask(fld, model.fluid_stl)
+    if not fluid.any():
+        fail("fluid mask is empty")
+
+    if HAS_IMPELLER:
+        impeller = detect_impeller_zone(fld, fluid, model, args.impeller_pad,
+                                        args.impeller_percentile, args.impeller_shape)
+    else:
+        impeller = np.zeros(fld.var.shape, bool)
+        log("impeller zone disabled; all zones from clustering")
+
+    # --- cluster the remainder
+    n_classes = None
+    if args.n_zones is not None:
+        n_classes = args.n_zones - 1 if HAS_IMPELLER else args.n_zones
+    rest = fluid & ~impeller
+    labels, centers, bounds = cluster_values(fld.var[rest], n_classes, use_log=not args.linear)
+
+    class_offset = 2 if HAS_IMPELLER else 1
+    zone_class = np.zeros(fld.var.shape, np.int32)
+    zone_class[impeller] = 1
+    zone_class[rest] = labels + class_offset
+    zone_id = spatialize(zone_class, fluid, args.min_zone_frac)
+
+    # --- outputs
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cell_vol = float(np.prod(fld.spacing))
+    class_means = {int(c): float(fld.var[zone_class == c].mean())
+                   for c in np.unique(zone_class) if c >= 1}
+    rows = collect_zone_rows(zone_class, zone_id, fluid, fld.var, cell_vol)
+    report(rows, fld.var_name, out_dir / "zones.csv")
+    write_labeled_vti(fld, zone_class, zone_id, out_dir / "zones.vti")
+    if not args.no_plots:
+        make_plots(out_dir, fld, fluid, zone_class, bounds, trace, t_steady, t_sel,
+                   model.impeller_axis, class_means)
+    if not args.no_render:
+        render_3d(out_dir, fld, zone_class, model, show=args.show, html=args.html,
+                  class_means=class_means)
+    return CaseResult(case_name=case.root.name, var_name=fld.var_name, t_sel=t_sel,
+                      global_mean=float(fld.var[fluid].mean()),
+                      class_rows=[(c, name, s) for level, c, name, s in rows
+                                  if level == "class"],
+                      class_means=class_means, out_dir=out_dir, model=model)
+
+
+# ---------------------------------------------------------------- batch comparison
+
+def compare_cases(results: list[CaseResult], out_dir: Path) -> None:
+    """Cross-case comparison of rank-aligned zones for one variable."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    var_name = results[0].var_name
+    unit = var_unit(var_name)
+    class_ids = sorted({c for r in results for c, _, _ in r.class_rows})
+    counts = {r.case_name: len(r.class_rows) for r in results}
+    if len(set(counts.values())) > 1:
+        warn(f"zone counts differ across cases {counts}; ranks aligned where present")
+    labels = {c: zone_label(c) for c in class_ids}
+
+    csv_path = out_dir / "comparison.csv"
+    with open(csv_path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["case", "zone", "class", "cells", "volume_m3", "volume_fraction",
+                    f"mean {var_name}", "std", "min", "max",
+                    "case global mean", "mean / global mean"])
+        for r in results:
+            for c, name, s in r.class_rows:
+                ratio = s["mean"] / r.global_mean if r.global_mean else np.nan
+                w.writerow([r.case_name, name, c, s["cells"], s["volume_m3"],
+                            s["vol_frac"], s["mean"], s["std"], s["min"], s["max"],
+                            r.global_mean, ratio])
+    log(f"wrote {csv_path}")
+
+    x = np.arange(len(class_ids))
+    n_cases = len(results)
+    width = 0.8 / n_cases
+
+    def grouped_bars(metric, fname, ylabel, title, logy=False, refline=None):
+        fig, ax = plt.subplots(figsize=(max(8.0, 1.5 + 0.9 * len(class_ids) * n_cases), 4.8))
+        for j, r in enumerate(results):
+            by_c = {c: s for c, _, s in r.class_rows}
+            vals = [metric(by_c[c], r) if c in by_c else np.nan for c in class_ids]
+            ax.bar(x + (j - (n_cases - 1) / 2) * width, vals, width, label=r.case_name)
+        if refline is not None:
+            ax.axhline(refline, color="k", ls="--", lw=1)
+        if logy:
+            ax.set_yscale("log")
+        ax.set_xticks(x)
+        ax.set_xticklabels([labels[c] for c in class_ids])
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        fig.savefig(out_dir / fname, dpi=150)
+        plt.close(fig)
+
+    grouped_bars(lambda s, r: s["mean"], "zone_means.png",
+                 f"zone mean{unit}",
+                 f"Zone means of {var_name} (per-case zoning, rank-aligned)", logy=True)
+    grouped_bars(lambda s, r: s["mean"] / r.global_mean, "zone_ratios.png",
+                 "zone mean / case global mean",
+                 f"Local vs global {var_name} (1.0 = case average)", refline=1.0)
+    grouped_bars(lambda s, r: 100 * s["vol_frac"], "zone_volfrac.png",
+                 "volume fraction [%]", "Zone volume fractions by case")
+
+    fig, ax = plt.subplots(figsize=(max(6.0, 1.5 + 1.2 * n_cases), 4.8))
+    ax.bar([r.case_name for r in results], [r.global_mean for r in results],
+           color="steelblue")
+    ax.set_ylabel(f"global fluid mean{unit}")
+    ax.set_title(f"Case global means of {var_name}")
+    ax.tick_params(axis="x", rotation=15)
+    fig.tight_layout()
+    fig.savefig(out_dir / "global_means.png", dpi=150)
+    plt.close(fig)
+    log(f"wrote comparison plots to {out_dir}")
+
+    print(f"\nZone mean / case global mean for '{var_name}':")
+    hdr = f"{'case':32} " + "".join(f"{labels[c]:>12}" for c in class_ids)
+    print(hdr)
+    print("-" * len(hdr))
+    for r in results:
+        by_c = {c: s for c, _, s in r.class_rows}
+        cells = "".join(f"{by_c[c]['mean'] / r.global_mean:>12.3f}" if c in by_c
+                        else f"{'-':>12}" for c in class_ids)
+        print(f"{r.case_name:32} {cells}")
+
+
+def load_zone_class(result: CaseResult):
+    """Reload the labeled grid written by run_case for comparison visuals."""
+    import pyvista as pv
+
+    grid = pv.read(str(result.out_dir / "zones.vti"))
+    nc = tuple(int(d) - 1 for d in grid.dimensions)
+    zone_class = np.asarray(grid.cell_data["ZoneClass"]).reshape((nc[2], nc[1], nc[0]))
+    return grid, zone_class, nc
+
+
+def batch_html_2d(results: list[CaseResult], out_path: Path) -> None:
+    """Single HTML with a grid of 2D side-view zone maps, one subplot per case."""
+    import base64
+    import io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap
+
+    n = len(results)
+    ncols = min(3, n)
+    nrows = -(-n // ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5.5 * nrows), squeeze=False)
+    for ax in axes.ravel()[n:]:
+        ax.axis("off")
+    for i, r in enumerate(results):
+        ax = axes.ravel()[i]
+        grid, zone_class, nc = load_zone_class(r)
+        o, sp = np.array(grid.origin), np.array(grid.spacing)
+        xc, yc, zc = (o[j] + (np.arange(nc[j]) + 0.5) * sp[j] for j in range(3))
+        u = (np.abs(r.model.impeller_axis) if r.model.impeller_axis is not None
+             else np.array([0.0, 1.0, 0.0]))
+        if u[2] < 0.9:  # vertical cross-section containing the rotation axis
+            img = zone_class[nc[2] // 2, :, :]
+            extent = [xc[0], xc[-1], yc[0], yc[-1]]
+            xl, yl = "x [m]", "y [m]"
+        else:
+            img = zone_class[:, nc[1] // 2, :]
+            extent = [xc[0], xc[-1], zc[0], zc[-1]]
+            xl, yl = "x [m]", "z [m]"
+        img = img.astype(float)
+        img[img < 1] = np.nan
+        n_classes = max(r.class_means)
+        colors = zone_colors(r.class_means)
+        cmap = ListedColormap([colors.get(c, (0.5, 0.5, 0.5, 1.0))
+                               for c in range(1, n_classes + 1)])
+        im = ax.imshow(img, origin="lower", extent=extent, cmap=cmap,
+                       vmin=0.5, vmax=n_classes + 0.5, interpolation="nearest")
+        unit = var_unit(r.var_name)
+        cbar = fig.colorbar(im, ax=ax, ticks=range(1, n_classes + 1),
+                            fraction=0.046, pad=0.04)
+        cbar.ax.set_yticklabels([zone_label(c, r.class_means, unit)
+                                 for c in range(1, n_classes + 1)], fontsize=7)
+        ax.set_xlabel(xl)
+        ax.set_ylabel(yl)
+        ax.set_aspect("equal")
+        ax.set_title(r.case_name, fontsize=11)
+    fig.suptitle(f"Zone maps by case \u2014 {results[0].var_name}", fontsize=13)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    out_path.write_text(
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<title>Zone maps \u2014 {results[0].var_name}</title></head>"
+        "<body style='margin:0;background:#fff'>"
+        f"<img style='width:100%' src='data:image/png;base64,{b64}'/></body></html>")
+    log(f"wrote {out_path}")
+
+
+def batch_html_3d(results: list[CaseResult], out_path: Path) -> None:
+    """Single interactive HTML with linked 3D zone views, one subplot per case."""
+    import pyvista as pv
+
+    n = len(results)
+    ncols = min(3, n)
+    nrows = -(-n // ncols)
+    pl = pv.Plotter(shape=(nrows, ncols), off_screen=True,
+                    window_size=(640 * ncols, 540 * nrows))
+    for i, r in enumerate(results):
+        pl.subplot(i // ncols, i % ncols)
+        grid, _, _ = load_zone_class(r)
+        colors = zone_colors(r.class_means)
+        unit = var_unit(r.var_name)
+        for c in sorted(r.class_means):
+            zone = grid.threshold([c - 0.5, c + 0.5], scalars="ZoneClass")
+            if zone.n_cells == 0:
+                continue
+            zone = zone.clip(normal="z", origin=grid.center, invert=False)  # cutaway
+            pl.add_mesh(zone, color=colors[c][:3], opacity=0.95 if c == 1 else 0.6,
+                        label=zone_label(c, r.class_means, unit))
+        if r.model.impeller_stl is not None:
+            try:
+                pl.add_mesh(pv.read(str(r.model.impeller_stl)), color="dimgray")
+            except Exception:
+                pass
+        pl.add_text(r.case_name, font_size=10)
+        # 2D overlays are dropped by the HTML export; 3D text above the tank survives
+        try:
+            b = grid.bounds
+            up_i = (int(np.argmax(np.abs(r.model.impeller_axis)))
+                    if r.model.impeller_axis is not None else 1)
+            h = 0.06 * max(b[1] - b[0], b[3] - b[2], b[5] - b[4])
+            center = list(grid.center)
+            center[up_i] = b[2 * up_i + 1] + 1.5 * h
+            if up_i != 2:
+                center[2] = b[5]  # float in front of the tank, clear of the shaft
+            txt = pv.Text3D(r.case_name, height=h, depth=0.1 * h,
+                            center=center, normal=(0.0, 0.0, 1.0))
+            pl.add_mesh(txt, color="black")
+        except Exception:
+            pass
+        up = (tuple(np.abs(r.model.impeller_axis))
+              if r.model.impeller_axis is not None else (0, 1, 0))
+        pl.view_vector((1.0, 0.6, 1.0), viewup=up)
+        pl.reset_camera(bounds=grid.bounds)
+    try:
+        pl.link_views()
+    except Exception:
+        pass
+    try:
+        pl.export_html(str(out_path))
+        log(f"wrote {out_path}")
+    except Exception as e:  # headless rendering can fail without a display/GPU
+        warn(f"3D comparison HTML failed ({e})")
+
+
+def case_out_dir(base: Path, variables: list[str], variable: str) -> Path:
+    """Flat output dir for a single variable, per-variable subdirs otherwise."""
+    return base if len(variables) == 1 else base / var_slug(variable)
+
+
+def run_batch(args) -> None:
+    root = args.case
+    if not root.is_dir():
+        fail(f"batch root not found: {root}")
+    cases = []
+    for d in sorted(root.iterdir()):
+        if d.is_dir() and not d.name.startswith(".") and d.name not in SKIP_DIRS:
+            c = discover_case(d)
+            if c.vti_series:
+                cases.append(c)
+    if not cases:
+        fail(f"no case subdirectories with VTI output found under {root}")
+    log(f"batch mode: {len(cases)} case(s): {', '.join(c.root.name for c in cases)}")
+    if args.n_zones is None:
+        warn("no --n-zones given: auto-k may differ per case, weakening rank alignment")
+
+    if args.list_vars:
+        for n in list_vti_arrays(cases[0].vti_series[0][1]):
+            print(n)
+        return
+
+    results: dict[str, list[CaseResult]] = {v: [] for v in args.variable}
+    for case in cases:
+        log(f"--- case: {case.root.name} ---")
+        log(f"found {len(case.vti_series)} VTI timesteps: "
+            f"t = {case.vti_series[0][0]:.3g} .. {case.vti_series[-1][0]:.3g} s")
+        model = parse_input_xml(case.input_xml, case.stl_files)
+        base = (args.output_dir / case.root.name) if args.output_dir else case.root / "zoner_output"
+        for v in args.variable:
+            try:
+                results[v].append(run_case(case, model, v, args,
+                                           case_out_dir(base, args.variable, v)))
+            except (Exception, SystemExit) as e:  # keep the batch alive on bad cases
+                warn(f"case '{case.root.name}', variable '{v}' failed: {e}")
+
+    comp_base = (args.output_dir / "zoner_comparison") if args.output_dir else root / "zoner_comparison"
+    for v in args.variable:
+        if len(results[v]) < 2:
+            warn(f"variable '{v}': only {len(results[v])} case(s) succeeded; skipping comparison")
+            continue
+        comp_dir = case_out_dir(comp_base, args.variable, v)
+        compare_cases(results[v], comp_dir)
+        batch_html_2d(results[v], comp_dir / "zones_2d.html")
+        batch_html_3d(results[v], comp_dir / "zones_3d.html")
+
+
 # ---------------------------------------------------------------- main
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("case", type=Path, help="M-Star case directory (or a single .vti file)")
-    ap.add_argument("--variable", default="edr",
-                    help="variable to analyze (fuzzy match, e.g. 'edr', 'shear', 'tke')")
+    ap.add_argument("case", type=Path,
+                    help="M-Star case directory or single .vti file; with --batch, "
+                         "a root directory containing case subdirectories")
+    ap.add_argument("--batch", action="store_true",
+                    help="process every case subdirectory under 'case' and compare "
+                         "zones across cases")
+    ap.add_argument("--variable", nargs="+", default=["edr"],
+                    help="variable(s) to analyze (fuzzy match, e.g. 'edr', 'shear', 'tke')")
     ap.add_argument("--n-zones", type=int, default=None,
                     help="total zones incl. impeller; omit for automatic selection")
     ap.add_argument("--time", type=float, default=None,
@@ -992,7 +1351,8 @@ def main(argv=None):
     ap.add_argument("--no-impeller-zone", action="store_true",
                     help="skip the geometric impeller zone; all n_zones come from clustering")
     ap.add_argument("--output-dir", type=Path, default=None,
-                    help="output directory (default: <case>/zoner_output)")
+                    help="output directory (default: <case>/zoner_output; in batch mode, "
+                         "per-case subdirs are created under it)")
     ap.add_argument("--list-vars", action="store_true", help="list VTI arrays and exit")
     ap.add_argument("--no-plots", action="store_true", help="skip diagnostic plots")
     ap.add_argument("--no-render", action="store_true", help="skip 3D rendering")
@@ -1003,6 +1363,13 @@ def main(argv=None):
 
     global HAS_IMPELLER
     HAS_IMPELLER = not args.no_impeller_zone
+    if args.n_zones is not None and args.n_zones < 2:
+        fail("--n-zones must be >= 2")
+
+    if args.batch:
+        run_batch(args)
+        log("done")
+        return
 
     case = discover_case(args.case)
     if not case.vti_series:
@@ -1016,67 +1383,11 @@ def main(argv=None):
         return
 
     model = parse_input_xml(case.input_xml, case.stl_files)
-
-    # --- analysis time
-    trace = steady_trace_from_stats(case, args.variable, args.steady_on)
-    t_steady = None
-    if args.time is not None:
-        t_target = args.time
-        log(f"user-defined analysis time: {t_target} s")
-    else:
-        if trace is None:
-            warn("no stats trace available; using last VTI timestep")
-            t_target = case.vti_series[-1][0]
-        else:
-            t_steady = detect_steady_state(trace[0], trace[1], args.window, args.tol)
-            t_target = t_steady
-            log(f"steady state detected at t = {t_steady:.3f} s")
-    later = [(t, f) for t, f in case.vti_series if t >= t_target - 1e-9]
-    t_sel, vti_path = later[0] if later else case.vti_series[-1]
-    log(f"analysis timestep: t = {t_sel:.3g} s ({vti_path.name})")
-
-    # --- load field & masks
-    fld = load_field(vti_path, args.variable, prefer_time_avg=not args.instantaneous)
-    fluid = build_fluid_mask(fld, model.fluid_stl)
-    if not fluid.any():
-        fail("fluid mask is empty")
-
-    if HAS_IMPELLER:
-        impeller = detect_impeller_zone(fld, fluid, model, args.impeller_pad,
-                                        args.impeller_percentile, args.impeller_shape)
-    else:
-        impeller = np.zeros(fld.var.shape, bool)
-        log("impeller zone disabled; all zones from clustering")
-
-    # --- cluster the remainder
-    if args.n_zones is not None and args.n_zones < 2:
-        fail("--n-zones must be >= 2")
-    n_classes = None
-    if args.n_zones is not None:
-        n_classes = args.n_zones - 1 if HAS_IMPELLER else args.n_zones
-    rest = fluid & ~impeller
-    labels, centers, bounds = cluster_values(fld.var[rest], n_classes, use_log=not args.linear)
-
-    class_offset = 2 if HAS_IMPELLER else 1
-    zone_class = np.zeros(fld.var.shape, np.int32)
-    zone_class[impeller] = 1
-    zone_class[rest] = labels + class_offset
-    zone_id = spatialize(zone_class, fluid, args.min_zone_frac)
-
-    # --- outputs
-    out_dir = args.output_dir or (args.case if args.case.is_dir() else args.case.parent) / "zoner_output"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cell_vol = float(np.prod(fld.spacing))
-    class_means = {int(c): float(fld.var[zone_class == c].mean())
-                   for c in np.unique(zone_class) if c >= 1}
-    report(zone_class, zone_id, fluid, fld.var, fld.var_name, cell_vol, out_dir / "zones.csv")
-    write_labeled_vti(fld, zone_class, zone_id, out_dir / "zones.vti")
-    if not args.no_plots:
-        make_plots(out_dir, fld, fluid, zone_class, bounds, trace, t_steady, t_sel,
-                   model.impeller_axis, class_means)
-    if not args.no_render:
-        render_3d(out_dir, fld, zone_class, model, show=args.show, html=args.html,
-                  class_means=class_means)
+    base = args.output_dir or (args.case if args.case.is_dir() else args.case.parent) / "zoner_output"
+    for v in args.variable:
+        if len(args.variable) > 1:
+            log(f"--- variable: {v} ---")
+        run_case(case, model, v, args, case_out_dir(base, args.variable, v))
     log("done")
 
 

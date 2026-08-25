@@ -13,17 +13,24 @@ Examples
 python cfd_zoner.py <case_dir> --variable edr --n-zones 4   # fixed zone count
 python cfd_zoner.py <case_dir> --variable shear             # auto zone count
 python cfd_zoner.py <case_dir> --variable edr --time 8      # manual time point
+python cfd_zoner.py <case_dir> --variable edr shear tke     # several variables
 python cfd_zoner.py <case_dir> --list-vars                  # show available arrays
 python cfd_zoner.py <case_dir> --html --no-plots            # interactive 3D HTML only
+python cfd_zoner.py <root_dir> --batch --n-zones 4          # all cases + comparison
 
 Positional argument
 -------------------
-case                      M-Star case directory (or a single .vti file)
+case                      M-Star case directory (or a single .vti file);
+                          with --batch, a root directory whose subdirectories
+                          are cases
 
 Options
 -------
 -h, --help                show help message and exit
---variable VARIABLE       variable to analyze, fuzzy match (default: edr)
+--batch                   process every case subdirectory under 'case', then
+                          compare zones across cases (rank-aligned: impeller vs
+                          impeller, class 1 vs class 1, ...)
+--variable VAR [VAR ...]  variable(s) to analyze, fuzzy match (default: edr)
                           aliases: edr, tke, velocity, shear, tracer,
                           kolmogorov, micromixing
 --n-zones N               total zones incl. impeller; omit for automatic
@@ -46,7 +53,8 @@ Options
                           fallback impeller zone shape (default: cylinder)
 --no-impeller-zone        skip the geometric impeller zone; all n_zones come
                           from clustering
---output-dir DIR          output directory (default: <case>/zoner_output)
+--output-dir DIR          output directory (default: <case>/zoner_output;
+                          in batch mode, per-case subdirs are created under it)
 --list-vars               list VTI arrays and exit
 --no-plots                skip diagnostic plots
 --no-render               skip 3D rendering
@@ -65,3 +73,21 @@ zone_slice*.png           zone maps (side, side2, top views)
 zone_pct_slice*.png       zone mean as % of global mean (same views)
 zones_3d.png / .html      3D rendering (cutaway) of the zones
 zones_3d.glb              3D model (insert into PowerPoint via Insert > 3D Models)
+
+With several variables, each variable writes to zoner_output/<variable>/.
+
+Batch outputs (written to <root>/zoner_comparison/)
+---------------------------------------------------
+comparison.csv            case x zone stats with case global mean and
+                          zone-mean / global-mean ratio
+zone_means.png            absolute zone means by case (log scale)
+zone_ratios.png           zone mean / case global mean (1.0 = case average)
+zone_volfrac.png          zone volume fractions by case
+global_means.png          case global fluid means
+zones_2d.html             2D zone maps, one subplot per case (self-contained)
+zones_3d.html             interactive 3D zone views, one subplot per case
+                          (linked cameras: rotate one, all follow)
+
+Zones are clustered per case; the comparison aligns them by rank
+(class 1 = highest values in each case). Pass --n-zones in batch mode so
+every case has the same zone count.
