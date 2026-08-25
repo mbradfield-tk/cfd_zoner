@@ -1,5 +1,7 @@
 cfd_zoner.py — zonal analysis of M-Star CFD volume (VTI) output
 
+See methodology.md for how zones are created and how to interpret the results.
+
 Expected case layout (M-Star native results directory):
     case/input.xml
     case/*.stl
