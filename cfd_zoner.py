@@ -1088,10 +1088,10 @@ def render_3d(out_dir: Path, fld: Field3D, zone_class: np.ndarray, model: ModelI
     colors = zone_colors(rank_by_class)
     for c in range(1, n_classes + 1):
         zone = lab.threshold([c - 0.5, c + 0.5], scalars="ZoneClass")
-        if zone.n_cells == 0:
-            continue
-        if cutaway:
+        if cutaway and zone.n_cells:
             zone = zone.clip(normal="z", origin=center, invert=False)
+        if zone.n_cells == 0:  # zone may vanish entirely in the cutaway
+            continue
         name = zone_label(c, class_means, var_unit(fld.var_name))
         pl.add_mesh(zone, color=colors[c][:3],
                     opacity=0.95 if c == 1 else 0.6, label=name)
@@ -1548,9 +1548,10 @@ def batch_html_3d(results: list[CaseResult], out_path: Path) -> None:
         unit = var_unit(r.var_name)
         for c in sorted(r.class_means):
             zone = grid.threshold([c - 0.5, c + 0.5], scalars="ZoneClass")
-            if zone.n_cells == 0:
+            if zone.n_cells:
+                zone = zone.clip(normal="z", origin=grid.center, invert=False)  # cutaway
+            if zone.n_cells == 0:  # zone may vanish entirely in the cutaway
                 continue
-            zone = zone.clip(normal="z", origin=grid.center, invert=False)  # cutaway
             pl.add_mesh(zone, color=colors[c][:3], opacity=0.95 if c == 1 else 0.6,
                         label=zone_label(c, r.class_means, unit))
         if r.model.impeller_stl is not None:
