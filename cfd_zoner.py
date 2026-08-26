@@ -516,6 +516,7 @@ def detect_impeller_zone(fld: Field3D, fluid: np.ndarray, model: ModelInfo,
 # ---------------------------------------------------------------- zoning
 
 def cluster_values(vals: np.ndarray, n_classes: int | None, use_log: bool,
+                   log_base: float = 10.0,
                    rng_seed: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (labels ordered low->high, class centers, boundaries) in value space."""
     from sklearn.cluster import KMeans
@@ -524,7 +525,7 @@ def cluster_values(vals: np.ndarray, n_classes: int | None, use_log: bool,
     if use_log:
         pos = vals[vals > 0]
         floor = pos.min() if pos.size else 1e-30
-        x = np.log10(np.clip(vals, floor, None)).astype(np.float64)
+        x = (np.log(np.clip(vals, floor, None)) / np.log(log_base)).astype(np.float64)
     else:
         x = vals.astype(np.float64)
     x = x[:, None]
@@ -559,8 +560,28 @@ def cluster_values(vals: np.ndarray, n_classes: int | None, use_log: bool,
     centers = km.cluster_centers_.ravel()[order]
     bounds = (centers[:-1] + centers[1:]) / 2
     if use_log:
-        centers, bounds = 10 ** centers, 10 ** bounds
+        centers, bounds = log_base ** centers, log_base ** bounds
     return labels.astype(np.int32), centers, bounds
+
+
+def bin_values(vals: np.ndarray, log_base: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Classes = fixed 1-log-unit bins: decades for base 10, doublings for base 2.
+
+    Zone count follows the data range (unlike k-means, where log2 vs log10 is
+    just a rescaling and yields identical zones). Returns (labels ordered so
+    0 = highest bin, bin centers, boundaries) in value space.
+    """
+    log_base = float(log_base)  # int base ** negative int power raises in numpy
+    pos = vals[vals > 0]
+    floor = pos.min() if pos.size else 1e-30
+    e = np.floor(np.log(np.clip(vals, floor, None)) / np.log(log_base)).astype(np.int64)
+    uniq = np.unique(e)[::-1]  # occupied bins only, highest first
+    labels = np.searchsorted(-uniq, -e).astype(np.int32)
+    centers = log_base ** (uniq + 0.5)
+    bounds = log_base ** uniq[:-1].astype(np.float64)  # lower edge of each upper bin
+    log(f"log-bin zoning (base {log_base:g}): {len(uniq)} occupied bins spanning "
+        f"{log_base ** uniq[-1]:.3g} .. {log_base ** (uniq[0] + 1):.3g}")
+    return labels, centers, bounds
 
 
 def spatialize(zone_class: np.ndarray, fluid: np.ndarray, min_frac: float) -> np.ndarray:
@@ -1144,7 +1165,14 @@ def run_case(case: Case, model: ModelInfo, variable: str, args, out_dir: Path) -
     if args.n_zones is not None:
         n_classes = args.n_zones - 1 if HAS_IMPELLER else args.n_zones
     rest = fluid & ~impeller
-    labels, centers, bounds = cluster_values(fld.var[rest], n_classes, use_log=not args.linear)
+    if args.log_bins:
+        if args.n_zones is not None:
+            warn("--n-zones is ignored with --log-bins (zone count follows the data range)")
+        labels, centers, bounds = bin_values(fld.var[rest], args.log_base)
+    else:
+        labels, centers, bounds = cluster_values(fld.var[rest], n_classes,
+                                                 use_log=not args.linear,
+                                                 log_base=args.log_base)
 
     class_offset = 2 if HAS_IMPELLER else 1
     zone_class = np.zeros(fld.var.shape, np.int32)
@@ -1639,7 +1667,14 @@ def main(argv=None):
     ap.add_argument("--window", type=float, default=1.0, help="steady-state window [s]")
     ap.add_argument("--instantaneous", action="store_true",
                     help="use instantaneous field even if a Time-Avg variant exists")
-    ap.add_argument("--linear", action="store_true", help="cluster on linear values, not log10")
+    ap.add_argument("--linear", action="store_true",
+                    help="cluster on linear values, not log-transformed")
+    ap.add_argument("--log-base", type=int, choices=[2, 10], default=10,
+                    help="log basis for k-means clustering (ignored with --linear)")
+    ap.add_argument("--log-bins", action="store_true",
+                    help="zone by fixed 1-log-unit bins instead of k-means: "
+                         "orders of magnitude with --log-base 10, doublings with "
+                         "--log-base 2 (zone count follows the data range)")
     ap.add_argument("--min-zone-frac", type=float, default=0.005,
                     help="min sub-zone size as fraction of fluid volume")
     ap.add_argument("--eta2-threshold", type=float, default=0.5,

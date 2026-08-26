@@ -18,6 +18,8 @@ python cfd_zoner.py <case_dir> --variable edr --time 8      # manual time point
 python cfd_zoner.py <case_dir> --variable edr shear tke     # several variables
 python cfd_zoner.py <case_dir> --list-vars                  # show available arrays
 python cfd_zoner.py <case_dir> --html --no-plots            # interactive 3D HTML only
+python cfd_zoner.py <case_dir> --log-bins                   # order-of-magnitude zones
+python cfd_zoner.py <case_dir> --log-bins --log-base 2      # zones per doubling
 python cfd_zoner.py <root_dir> --batch --n-zones 4          # all cases + comparison
 
 Positional argument
@@ -45,7 +47,17 @@ Options
 --window W                steady-state window [s] (default: 1.0)
 --instantaneous           use instantaneous field even if a Time-Avg variant
                           exists (default: use Time-Avg when available)
---linear                  cluster on linear values instead of log10
+--linear                  cluster on linear values instead of log-transformed
+--log-base {2,10}         log basis for zoning (default: 10). With the default
+                          k-means zoning this is cosmetic (k-means is scale-
+                          invariant, log2 and log10 give identical zones); it
+                          matters with --log-bins
+--log-bins                zone by fixed 1-log-unit bins instead of k-means:
+                          class boundaries at powers of the base, i.e. orders
+                          of magnitude (10^k) with --log-base 10 or doublings
+                          (2^k) with --log-base 2. The zone count follows the
+                          data range (--n-zones is ignored); log2 gives ~3.3x
+                          more zones than log10
 --min-zone-frac F         min sub-zone size as fraction of fluid volume;
                           smaller fragments are merged (default: 0.005)
 --eta2-threshold T        between-zone variance fraction (eta^2) above which
@@ -112,6 +124,19 @@ zones_3d.html             interactive 3D zone views, one subplot per case
 Zones are clustered per case; the comparison aligns them by rank
 (class 1 = highest values in each case). Pass --n-zones in batch mode so
 every case has the same zone count.
+
+Zoning methods
+--------------
+Default (k-means)         classes found by k-means on log10 values: boundaries
+                          fall wherever the data naturally clusters (variable
+                          width in log space); zone count from --n-zones or
+                          silhouette auto-selection.
+--log-bins                classes are fixed 1-log-unit bins: every order of
+                          magnitude (--log-base 10) or every doubling
+                          (--log-base 2). Comparable across cases by
+                          construction, but sparsely populated bins may be
+                          absorbed by the fragment merging step; use
+                          --min-zone-frac 0 for strictly pure bins.
 
 Interpreting the heterogeneity metrics (heterogeneity.csv)
 ----------------------------------------------------------
