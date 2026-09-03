@@ -48,16 +48,15 @@ Options
 --instantaneous           use instantaneous field even if a Time-Avg variant
                           exists (default: use Time-Avg when available)
 --linear                  cluster on linear values instead of log-transformed
---log-base {2,10}         log basis for zoning (default: 10). With the default
-                          k-means zoning this is cosmetic (k-means is scale-
-                          invariant, log2 and log10 give identical zones); it
+--log-base B              log base (> 1) for zoning (default: 10). With the
+                          default k-means zoning this is cosmetic (k-means is
+                          scale-invariant, any base gives identical zones); it
                           matters with --log-bins
 --log-bins                zone by fixed 1-log-unit bins instead of k-means:
-                          class boundaries at powers of the base, i.e. orders
-                          of magnitude (10^k) with --log-base 10 or doublings
-                          (2^k) with --log-base 2. The zone count follows the
-                          data range (--n-zones is ignored); log2 gives ~3.3x
-                          more zones than log10
+                          class boundaries at powers of --log-base, e.g. orders
+                          of magnitude (base 10), doublings (base 2), or any
+                          other base > 1. The zone count follows the data range
+                          (--n-zones is ignored); smaller bases give more zones
 --min-zone-frac F         min sub-zone size as fraction of fluid volume;
                           smaller fragments are merged (default: 0.005)
 --eta2-threshold T        between-zone variance fraction (eta^2) above which

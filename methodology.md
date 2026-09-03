@@ -35,6 +35,9 @@ Selects the cells all later steps operate on:
 
 - Cells with zero velocity magnitude are excluded (M-Star writes exact zeros
   for solid/exterior cells).
+- Cells inside the moving-body STL (impeller + shaft) are excluded: unlike
+  static bodies, moving-body cells carry the solid's velocity, so the
+  zero-velocity blanking does not catch them.
 - The fill-level STL from input.xml restricts to the liquid. Box-like meshes
   use a fast axis-aligned bounds test; arbitrary shapes use a
   point-in-surface test.

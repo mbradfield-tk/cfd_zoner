@@ -413,13 +413,36 @@ def load_field(path: Path, var_query: str, prefer_time_avg: bool) -> Field3D:
 
 # ---------------------------------------------------------------- masks
 
-def build_fluid_mask(fld: Field3D, fluid_stl: Path | None) -> np.ndarray:
+def stl_inside_mask(fld: Field3D, stl: Path) -> np.ndarray:
+    """Cells whose centers lie inside the STL surface (enclosed-points test)."""
+    import pyvista as pv
+
+    X, Y, Z = fld.cell_centers_3d()
+    pts = pv.PolyData(np.column_stack([X.ravel(), Y.ravel(), Z.ravel()]))
+    surf = pv.read(str(stl))
+    try:  # pyvista >= 0.46; select_enclosed_points is deprecated
+        sel = pts.select_interior_points(surf, check_surface=False)
+        inside = np.asarray(sel["selected_points"])
+    except AttributeError:
+        sel = pts.select_enclosed_points(surf, check_surface=False)
+        inside = sel["SelectedPoints"].astype(bool)
+    return inside.reshape(fld.var.shape)
+
+
+def build_fluid_mask(fld: Field3D, fluid_stl: Path | None,
+                     moving_stl: Path | None = None) -> np.ndarray:
     # solid/exterior cells in M-Star volume output carry exact zeros
     valid = np.isfinite(fld.var)
     if fld.velmag is not None:
         valid &= fld.velmag > 0.0
         log(f"solid/exterior blanking via zero velocity magnitude: "
             f"{np.count_nonzero(~valid):,} of {valid.size:,} cells excluded")
+    if moving_stl is not None:
+        # moving-body cells carry the solid's velocity, so zero-blanking misses them
+        solid = stl_inside_mask(fld, moving_stl)
+        valid &= ~solid
+        log(f"moving body '{moving_stl.name}' excluded: "
+            f"{np.count_nonzero(solid):,} cells")
     if fluid_stl is None:
         return valid
 
@@ -440,9 +463,7 @@ def build_fluid_mask(fld: Field3D, fluid_stl: Path | None) -> np.ndarray:
                   (Z >= b[2, 0]) & (Z <= b[2, 1]))
         log(f"fluid mask from '{fluid_stl.name}' (axis-aligned box bounds)")
     else:
-        pts = pv.PolyData(np.column_stack([X.ravel(), Y.ravel(), Z.ravel()]))
-        sel = pts.select_enclosed_points(mesh.extract_surface(), check_surface=False)
-        inside = sel["SelectedPoints"].astype(bool).reshape(fld.var.shape)
+        inside = stl_inside_mask(fld, fluid_stl)
         log(f"fluid mask from '{fluid_stl.name}' (enclosed-points test)")
     fluid = valid & inside
     log(f"fluid cells: {np.count_nonzero(fluid):,} "
@@ -565,9 +586,9 @@ def cluster_values(vals: np.ndarray, n_classes: int | None, use_log: bool,
 
 
 def bin_values(vals: np.ndarray, log_base: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Classes = fixed 1-log-unit bins: decades for base 10, doublings for base 2.
+    """Classes = fixed 1-log-unit bins, e.g. decades (base 10) or doublings (base 2).
 
-    Zone count follows the data range (unlike k-means, where log2 vs log10 is
+    Zone count follows the data range (unlike k-means, where the log base is
     just a rescaling and yields identical zones). Returns (labels ordered so
     0 = highest bin, bin centers, boundaries) in value space.
     """
@@ -1149,7 +1170,7 @@ def run_case(case: Case, model: ModelInfo, variable: str, args, out_dir: Path) -
 
     # --- load field & masks
     fld = load_field(vti_path, variable, prefer_time_avg=not args.instantaneous)
-    fluid = build_fluid_mask(fld, model.fluid_stl)
+    fluid = build_fluid_mask(fld, model.fluid_stl, model.impeller_stl)
     if not fluid.any():
         fail("fluid mask is empty")
 
@@ -1670,12 +1691,15 @@ def main(argv=None):
                     help="use instantaneous field even if a Time-Avg variant exists")
     ap.add_argument("--linear", action="store_true",
                     help="cluster on linear values, not log-transformed")
-    ap.add_argument("--log-base", type=int, choices=[2, 10], default=10,
-                    help="log basis for k-means clustering (ignored with --linear)")
+    ap.add_argument("--log-base", type=float, default=10.0,
+                    help="log base (> 1) for zoning; with the default k-means "
+                         "zoning it is cosmetic, with --log-bins it sets the "
+                         "bin width (ignored with --linear)")
     ap.add_argument("--log-bins", action="store_true",
                     help="zone by fixed 1-log-unit bins instead of k-means: "
-                         "orders of magnitude with --log-base 10, doublings with "
-                         "--log-base 2 (zone count follows the data range)")
+                         "class boundaries at powers of --log-base, e.g. orders "
+                         "of magnitude (base 10) or doublings (base 2); zone "
+                         "count follows the data range")
     ap.add_argument("--min-zone-frac", type=float, default=0.005,
                     help="min sub-zone size as fraction of fluid volume")
     ap.add_argument("--eta2-threshold", type=float, default=0.5,
@@ -1707,6 +1731,8 @@ def main(argv=None):
     HAS_IMPELLER = not args.no_impeller_zone
     if args.n_zones is not None and args.n_zones < 2:
         fail("--n-zones must be >= 2")
+    if args.log_base <= 1:
+        fail("--log-base must be > 1")
 
     if args.batch:
         run_batch(args)
