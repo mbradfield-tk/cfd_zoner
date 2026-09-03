@@ -937,18 +937,21 @@ def make_plots(out_dir: Path, fld: Field3D, fluid: np.ndarray, zone_class: np.nd
         fig.savefig(out_dir / fname, dpi=150)
         plt.close(fig)
 
+    # slice through the tank axis (coordinate 0), not the grid mid-index: the
+    # domain is not necessarily centered, so mid-index planes can cut off-axis
+    kx, ky, kz = (int(np.argmin(np.abs(cc))) for cc in (xc, yc, zc))
     if u[2] < 0.9:  # slice normal to z, plus perpendicular side view normal to x
         views = [
-            (zone_class[len(zc) // 2, :, :], [xc[0], xc[-1], yc[0], yc[-1]],
+            (zone_class[kz, :, :], [xc[0], xc[-1], yc[0], yc[-1]],
              "x [m]", "y [m]", "side view, facing +Z", ""),
-            (zone_class[:, :, len(xc) // 2].T, [zc[0], zc[-1], yc[0], yc[-1]],
+            (zone_class[:, :, kx].T, [zc[0], zc[-1], yc[0], yc[-1]],
              "z [m]", "y [m]", "side view, facing +X", "_side2"),
         ]
     else:  # z-axis tank: slice normal to y, plus perpendicular side view normal to x
         views = [
-            (zone_class[:, len(yc) // 2, :], [xc[0], xc[-1], zc[0], zc[-1]],
+            (zone_class[:, ky, :], [xc[0], xc[-1], zc[0], zc[-1]],
              "x [m]", "z [m]", "side view, facing +Y", ""),
-            (zone_class[:, :, len(xc) // 2], [yc[0], yc[-1], zc[0], zc[-1]],
+            (zone_class[:, :, kx], [yc[0], yc[-1], zc[0], zc[-1]],
              "y [m]", "z [m]", "side view, facing +X", "_side2"),
         ]
 
@@ -1362,18 +1365,21 @@ def load_zone_class(result: CaseResult):
 
 
 def zone_slice_2d(r: CaseResult):
-    """Mid-tank vertical cross-section of ZoneClass: (int image, extent, xlabel, ylabel)."""
+    """Vertical cross-section of ZoneClass through the tank axis:
+    (int image, extent, xlabel, ylabel)."""
     grid, zone_class, nc = load_zone_class(r)
     o, sp = np.array(grid.origin), np.array(grid.spacing)
     xc, yc, zc = (o[j] + (np.arange(nc[j]) + 0.5) * sp[j] for j in range(3))
     u = (np.abs(r.model.impeller_axis) if r.model.impeller_axis is not None
          else np.array([0.0, 1.0, 0.0]))
-    if u[2] < 0.9:  # vertical cross-section containing the rotation axis
-        img = zone_class[nc[2] // 2, :, :]
+    if u[2] < 0.9:  # y-up tank: slice normal to z through z=0 (not the grid mid-index)
+        k = int(np.argmin(np.abs(zc)))
+        img = zone_class[k, :, :]
         extent = [xc[0], xc[-1], yc[0], yc[-1]]
         xl, yl = "x [m]", "y [m]"
-    else:
-        img = zone_class[:, nc[1] // 2, :]
+    else:  # z-up tank: slice normal to y through y=0
+        k = int(np.argmin(np.abs(yc)))
+        img = zone_class[:, k, :]
         extent = [xc[0], xc[-1], zc[0], zc[-1]]
         xl, yl = "x [m]", "z [m]"
     return img, extent, xl, yl
@@ -1513,7 +1519,12 @@ def batch_html_2d_normalized(results: list[CaseResult], out_path: Path) -> None:
 
     var_name = results[0].var_name
     all_means = [m for r in results for m in r.class_means.values()]
-    vmin, vmax = min(all_means), max(all_means)
+    # color scale spans the full data range of the batch, not just the zone means
+    zmins = [s["min"] for r in results for _, _, s in r.class_rows if np.isfinite(s["min"])]
+    zmaxs = [s["max"] for r in results for _, _, s in r.class_rows if np.isfinite(s["max"])]
+    pos_mins = [v for v in zmins if v > 0]
+    vmin = min(pos_mins) if pos_mins else min(all_means)
+    vmax = max(zmaxs + all_means)
     norm = LogNorm(vmin, vmax) if vmin > 0 else Normalize(vmin, vmax)
 
     n = len(results)
@@ -1542,7 +1553,7 @@ def batch_html_2d_normalized(results: list[CaseResult], out_path: Path) -> None:
         ax.set_title(r.case_name, fontsize=11)
     cbar = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.04, pad=0.02)
     cbar.set_label(f"zone mean {var_name}")
-    fig.suptitle(f"Zone means on a continuous scale "
+    fig.suptitle(f"Zone means on a continuous scale, batch range "
                  f"({vmin:.3g} .. {vmax:.3g}) \u2014 {var_name}", fontsize=13)
     fig_to_html(fig, f"Zone means (normalized) \u2014 {var_name}", out_path)
 
