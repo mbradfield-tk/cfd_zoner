@@ -892,22 +892,25 @@ def make_plots(out_dir: Path, fld: Field3D, fluid: np.ndarray, zone_class: np.nd
     n_classes = int(zone_class.max())
     cmap = ListedColormap([colors.get(c, plt.cm.turbo(0.5)) for c in range(1, n_classes + 1)])
 
+    # fixed rects: varying colorbar label widths must not resize the map
+    map_rect, cbar_rect = [0.09, 0.07, 0.60, 0.86], [0.71, 0.07, 0.03, 0.86]
+
     def plot_slice(img, extent, xlabel, ylabel, title, fname):
         img = img.astype(float)
         img[img < 1] = np.nan
-        fig, ax2 = plt.subplots(figsize=(8, 7))
+        fig = plt.figure(figsize=(8, 7))
+        ax2 = fig.add_axes(map_rect)
+        cax = fig.add_axes(cbar_rect)
         im = ax2.imshow(img, origin="lower", extent=extent, cmap=cmap,
                         vmin=0.5, vmax=n_classes + 0.5, interpolation="nearest")
-        cbar = fig.colorbar(im, ax=ax2, ticks=range(1, n_classes + 1),
-                            fraction=0.046, pad=0.04)
+        cbar = fig.colorbar(im, cax=cax, ticks=range(1, n_classes + 1))
         cbar.ax.set_yticklabels([zone_label(c, class_means, unit)
-                                 for c in range(1, n_classes + 1)])
+                                 for c in range(1, n_classes + 1)], fontsize=8)
         cbar.set_label("zone (class 1 = highest values)")
         ax2.set_xlabel(xlabel)
         ax2.set_ylabel(ylabel)
         ax2.set_title(title)
         ax2.set_aspect("equal")
-        fig.tight_layout()
         fig.savefig(out_dir / fname, dpi=150)
         plt.close(fig)
 
@@ -920,16 +923,17 @@ def make_plots(out_dir: Path, fld: Field3D, fluid: np.ndarray, zone_class: np.nd
 
     def plot_pct_slice(img_cls, extent, xlabel, ylabel, title, fname):
         img = np.where(img_cls >= 1, pct_lut[np.clip(img_cls, 0, n_classes)], np.nan)
-        fig, ax2 = plt.subplots(figsize=(8, 7))
+        fig = plt.figure(figsize=(8, 7))
+        ax2 = fig.add_axes(map_rect)
+        cax = fig.add_axes(cbar_rect)
         im = ax2.imshow(img, origin="lower", extent=extent, cmap="turbo",
                         vmin=0, vmax=np.nanmax(pct_lut), interpolation="nearest")
-        cbar = fig.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
+        cbar = fig.colorbar(im, cax=cax)
         cbar.set_label(f"zone mean [% of global mean {overall_mean:.3g}{unit}]")
         ax2.set_xlabel(xlabel)
         ax2.set_ylabel(ylabel)
         ax2.set_title(title)
         ax2.set_aspect("equal")
-        fig.tight_layout()
         fig.savefig(out_dir / fname, dpi=150)
         plt.close(fig)
 
@@ -1398,6 +1402,13 @@ def _case_grid(n: int):
     return ncols, -(-n // ncols)
 
 
+def _shared_extent(slices) -> tuple[float, float, float, float]:
+    """Union of per-case slice extents so all subplots render at one scale."""
+    ex = [e for _, e, _, _ in slices]
+    return (min(e[0] for e in ex), max(e[1] for e in ex),
+            min(e[2] for e in ex), max(e[3] for e in ex))
+
+
 def batch_html_2d(results: list[CaseResult], out_path: Path) -> None:
     """Single HTML with a grid of 2D side-view zone maps, one subplot per case."""
     import matplotlib
@@ -1407,12 +1418,14 @@ def batch_html_2d(results: list[CaseResult], out_path: Path) -> None:
 
     n = len(results)
     ncols, nrows = _case_grid(n)
+    slices = [zone_slice_2d(r) for r in results]
+    x0, x1, y0, y1 = _shared_extent(slices)
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5.5 * nrows), squeeze=False)
     for ax in axes.ravel()[n:]:
         ax.axis("off")
     for i, r in enumerate(results):
         ax = axes.ravel()[i]
-        img, extent, xl, yl = zone_slice_2d(r)
+        img, extent, xl, yl = slices[i]
         imgf = img.astype(float)
         imgf[imgf < 1] = np.nan
         n_classes = max(r.class_means)
@@ -1428,6 +1441,8 @@ def batch_html_2d(results: list[CaseResult], out_path: Path) -> None:
                                  for c in range(1, n_classes + 1)], fontsize=7)
         ax.set_xlabel(xl)
         ax.set_ylabel(yl)
+        ax.set_xlim(x0, x1)
+        ax.set_ylim(y0, y1)
         ax.set_aspect("equal")
         ax.set_title(r.case_name, fontsize=11)
     fig.suptitle(f"Zone maps by case \u2014 {results[0].var_name}", fontsize=13)
@@ -1453,13 +1468,15 @@ def batch_html_2d_common(results: list[CaseResult], out_path: Path) -> None:
 
     n = len(results)
     ncols, nrows = _case_grid(n)
+    slices = [zone_slice_2d(r) for r in results]
+    x0, x1, y0, y1 = _shared_extent(slices)
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols + 2.0, 5.5 * nrows),
                              squeeze=False)
     for ax in axes.ravel()[n:]:
         ax.axis("off")
     for i, r in enumerate(results):
         ax = axes.ravel()[i]
-        img, extent, xl, yl = zone_slice_2d(r)
+        img, extent, xl, yl = slices[i]
         imgf = img.astype(float)
         imgf[imgf < 1] = np.nan
         n_classes = max(r.class_means)
@@ -1470,6 +1487,8 @@ def batch_html_2d_common(results: list[CaseResult], out_path: Path) -> None:
                   vmin=0.5, vmax=n_classes + 0.5, interpolation="nearest")
         ax.set_xlabel(xl)
         ax.set_ylabel(yl)
+        ax.set_xlim(x0, x1)
+        ax.set_ylim(y0, y1)
         ax.set_aspect("equal")
         ax.set_title(r.case_name, fontsize=11)
     # one shared colorbar over the pooled zone-mean values
@@ -1499,6 +1518,8 @@ def batch_html_2d_normalized(results: list[CaseResult], out_path: Path) -> None:
 
     n = len(results)
     ncols, nrows = _case_grid(n)
+    slices = [zone_slice_2d(r) for r in results]
+    x0, x1, y0, y1 = _shared_extent(slices)
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols + 1.5, 5.5 * nrows),
                              squeeze=False)
     for ax in axes.ravel()[n:]:
@@ -1506,7 +1527,7 @@ def batch_html_2d_normalized(results: list[CaseResult], out_path: Path) -> None:
     im = None
     for i, r in enumerate(results):
         ax = axes.ravel()[i]
-        img, extent, xl, yl = zone_slice_2d(r)
+        img, extent, xl, yl = slices[i]
         lut = np.full(max(r.class_means) + 1, np.nan)
         for c, m in r.class_means.items():
             lut[c] = m
@@ -1515,6 +1536,8 @@ def batch_html_2d_normalized(results: list[CaseResult], out_path: Path) -> None:
                        interpolation="nearest")
         ax.set_xlabel(xl)
         ax.set_ylabel(yl)
+        ax.set_xlim(x0, x1)
+        ax.set_ylim(y0, y1)
         ax.set_aspect("equal")
         ax.set_title(r.case_name, fontsize=11)
     cbar = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.04, pad=0.02)
