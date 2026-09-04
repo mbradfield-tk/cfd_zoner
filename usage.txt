@@ -21,6 +21,8 @@ python cfd_zoner.py <case_dir> --html --no-plots            # interactive 3D HTM
 python cfd_zoner.py <case_dir> --log-bins                   # order-of-magnitude zones
 python cfd_zoner.py <case_dir> --log-bins --log-base 2      # zones per doubling
 python cfd_zoner.py <root_dir> --batch --n-zones 4          # all cases + comparison
+python cfd_zoner.py <root_dir> --batch --comparison-only    # redo comparison only,
+                                                            # reusing case outputs
 
 Positional argument
 -------------------
@@ -34,6 +36,11 @@ Options
 --batch                   process every case subdirectory under 'case', then
                           compare zones across cases (rank-aligned: impeller vs
                           impeller, class 1 vs class 1, ...)
+--comparison-only         with --batch: skip the per-case pipeline and rebuild
+                          only the zoner_comparison outputs from each case's
+                          existing zoner_output (zones.csv, zones.vti,
+                          heterogeneity.csv); cases without existing results
+                          are skipped with a warning
 --variable VAR [VAR ...]  variable(s) to analyze, fuzzy match (default: edr)
                           aliases: edr, tke, velocity, shear, tracer,
                           kolmogorov, micromixing
@@ -113,8 +120,8 @@ zones_2d_common.html      2D zone maps on one shared discrete color scale:
                           zones with the same mean get the same color, so
                           differences across cases are directly visible
 zones_2d_normalized.html  2D maps of zone means on a continuous (log) color
-                          scale spanning the lowest..highest zone mean across
-                          all cases
+                          scale spanning only the lowest..highest zone mean
+                          across all cases
 exposure_cdf.png          combined volume-exposure curves of all cases
                           (dashed lines: case global means)
 zones_3d.html             interactive 3D zone views, one subplot per case

@@ -1415,6 +1415,41 @@ def _shared_extent(slices) -> tuple[float, float, float, float]:
             min(e[2] for e in ex), max(e[3] for e in ex))
 
 
+def _slice_data_bounds(img, extent, margin: float = 0.03):
+    """Bounding box of labeled (>= 1) cells in slice coordinates, so a subplot
+    can be cropped to the reactor instead of the full simulation domain."""
+    ii, jj = np.nonzero(img >= 1)
+    if ii.size == 0:
+        return extent[0], extent[1], extent[2], extent[3]
+    ny, nx = img.shape
+    dx = (extent[1] - extent[0]) / nx
+    dy = (extent[3] - extent[2]) / ny
+    x0, x1 = extent[0] + jj.min() * dx, extent[0] + (jj.max() + 1) * dx
+    y0, y1 = extent[2] + ii.min() * dy, extent[2] + (ii.max() + 1) * dy
+    mx, my = margin * (x1 - x0), margin * (y1 - y0)
+    return x0 - mx, x1 + mx, y0 - my, y1 + my
+
+
+def _grouped_limits(slices) -> tuple[list[tuple[float, float, float, float]], float]:
+    """Per-case axis limits and a common box aspect: same-diameter vessels
+    (5 mm bins on slice width) share identical limits with the diameter spanning
+    the full subplot width, so all reactors render at the same displayed size."""
+    case_bounds = [_slice_data_bounds(img, ext) for img, ext, _, _ in slices]
+    gkey = [round((b[1] - b[0]) / 0.005) for b in case_bounds]
+    glim: dict[int, tuple[float, float, float, float]] = {}
+    for k, b in zip(gkey, case_bounds):
+        g = glim.get(k)
+        glim[k] = b if g is None else (min(g[0], b[0]), max(g[1], b[1]),
+                                       min(g[2], b[2]), max(g[3], b[3]))
+    box_aspect = max((y1 - y0) / (x1 - x0) for x0, x1, y0, y1 in glim.values())
+    # y-span tied to the x-span keeps meters undistorted within each subplot
+    limits = []
+    for k in gkey:
+        x0, x1, y0, _ = glim[k]
+        limits.append((x0, x1, y0, y0 + (x1 - x0) * box_aspect))
+    return limits, box_aspect
+
+
 def batch_html_2d(results: list[CaseResult], out_path: Path) -> None:
     """Single HTML with a grid of 2D side-view zone maps, one subplot per case."""
     import matplotlib
@@ -1475,7 +1510,7 @@ def batch_html_2d_common(results: list[CaseResult], out_path: Path) -> None:
     n = len(results)
     ncols, nrows = _case_grid(n)
     slices = [zone_slice_2d(r) for r in results]
-    x0, x1, y0, y1 = _shared_extent(slices)
+    limits, box_aspect = _grouped_limits(slices)
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols + 2.0, 5.5 * nrows),
                              squeeze=False)
     for ax in axes.ravel()[n:]:
@@ -1490,12 +1525,14 @@ def batch_html_2d_common(results: list[CaseResult], out_path: Path) -> None:
                                if c in r.class_means else (0.5, 0.5, 0.5, 1.0)
                                for c in range(1, n_classes + 1)])
         ax.imshow(imgf, origin="lower", extent=extent, cmap=cmap,
-                  vmin=0.5, vmax=n_classes + 0.5, interpolation="nearest")
+                  vmin=0.5, vmax=n_classes + 0.5, interpolation="nearest",
+                  aspect="auto")
         ax.set_xlabel(xl)
         ax.set_ylabel(yl)
+        x0, x1, y0, y1 = limits[i]
         ax.set_xlim(x0, x1)
         ax.set_ylim(y0, y1)
-        ax.set_aspect("equal")
+        ax.set_box_aspect(box_aspect)
         ax.set_title(r.case_name, fontsize=11)
     # one shared colorbar over the pooled zone-mean values
     sm = plt.cm.ScalarMappable(
@@ -1511,26 +1548,30 @@ def batch_html_2d_common(results: list[CaseResult], out_path: Path) -> None:
 
 def batch_html_2d_normalized(results: list[CaseResult], out_path: Path) -> None:
     """Zone maps colored by zone mean on a continuous scale normalized to the
-    lowest/highest zone mean across all cases."""
+    lowest/highest zone mean actually visible in the displayed slices."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import LogNorm, Normalize
 
     var_name = results[0].var_name
-    all_means = [m for r in results for m in r.class_means.values()]
-    # color scale spans the full data range of the batch, not just the zone means
-    zmins = [s["min"] for r in results for _, _, s in r.class_rows if np.isfinite(s["min"])]
-    zmaxs = [s["max"] for r in results for _, _, s in r.class_rows if np.isfinite(s["max"])]
-    pos_mins = [v for v in zmins if v > 0]
-    vmin = min(pos_mins) if pos_mins else min(all_means)
-    vmax = max(zmaxs + all_means)
-    norm = LogNorm(vmin, vmax) if vmin > 0 else Normalize(vmin, vmax)
-
     n = len(results)
     ncols, nrows = _case_grid(n)
     slices = [zone_slice_2d(r) for r in results]
-    x0, x1, y0, y1 = _shared_extent(slices)
+    # color scale spans only the zone means of classes present in the slices,
+    # so unseen zones (e.g. tiny near-zero pockets) don't stretch the scale
+    vis_means = [r.class_means[int(c)]
+                 for r, (img, _, _, _) in zip(results, slices)
+                 for c in np.unique(img[img >= 1]) if int(c) in r.class_means]
+    if not vis_means:
+        vis_means = [m for r in results for m in r.class_means.values()]
+    pos_means = [m for m in vis_means if m > 0]
+    vmin = min(pos_means) if pos_means else min(vis_means)
+    vmax = max(vis_means)
+    norm = LogNorm(vmin, vmax) if vmin > 0 else Normalize(vmin, vmax)
+
+    limits, box_aspect = _grouped_limits(slices)
+
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols + 1.5, 5.5 * nrows),
                              squeeze=False)
     for ax in axes.ravel()[n:]:
@@ -1544,16 +1585,17 @@ def batch_html_2d_normalized(results: list[CaseResult], out_path: Path) -> None:
             lut[c] = m
         vals = np.where(img >= 1, lut[np.clip(img, 0, len(lut) - 1)], np.nan)
         im = ax.imshow(vals, origin="lower", extent=extent, cmap="turbo", norm=norm,
-                       interpolation="nearest")
+                       interpolation="nearest", aspect="auto")
         ax.set_xlabel(xl)
         ax.set_ylabel(yl)
+        x0, x1, y0, y1 = limits[i]
         ax.set_xlim(x0, x1)
         ax.set_ylim(y0, y1)
-        ax.set_aspect("equal")
+        ax.set_box_aspect(box_aspect)
         ax.set_title(r.case_name, fontsize=11)
     cbar = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.04, pad=0.02)
     cbar.set_label(f"zone mean {var_name}")
-    fig.suptitle(f"Zone means on a continuous scale, batch range "
+    fig.suptitle(f"Zone means on a continuous scale, displayed-zone range "
                  f"({vmin:.3g} .. {vmax:.3g}) \u2014 {var_name}", fontsize=13)
     fig_to_html(fig, f"Zone means (normalized) \u2014 {var_name}", out_path)
 
@@ -1650,6 +1692,50 @@ def case_out_dir(base: Path, variables: list[str], variable: str) -> Path:
     return base if len(variables) == 1 else base / var_slug(variable)
 
 
+def load_case_result(case: Case, model: ModelInfo, out_dir: Path) -> CaseResult | None:
+    """Rebuild a CaseResult from a previous run's zoner_output, for --comparison-only."""
+    zones_csv, zones_vti = out_dir / "zones.csv", out_dir / "zones.vti"
+    if not zones_csv.is_file() or not zones_vti.is_file():
+        return None
+
+    class_rows: list[tuple[int, str, dict]] = []
+    with open(zones_csv, newline="") as fh:
+        rdr = csv.reader(fh)
+        header = next(rdr)
+        var_name = header[6].removeprefix("mean ")
+        for row in rdr:
+            if row[0] != "class":
+                continue
+            s = {"cells": int(row[3]), "volume_m3": float(row[4]),
+                 "vol_frac": float(row[5]), "mean": float(row[6]),
+                 "std": float(row[7]), "min": float(row[8]), "max": float(row[9])}
+            class_rows.append((int(row[1]), row[2], s))
+    if not class_rows:
+        return None
+    class_means = {c: s["mean"] for c, _, s in class_rows}
+
+    het: dict = {}
+    het_csv = out_dir / "heterogeneity.csv"
+    if het_csv.is_file():
+        with open(het_csv, newline="") as fh:
+            rdr = csv.reader(fh)
+            next(rdr)
+            for k, v in rdr:
+                het[k] = v == "True" if k == "significant_gradients" else float(v)
+
+    import pyvista as pv
+
+    grid = pv.read(str(zones_vti))
+    zone_class = np.asarray(grid.cell_data["ZoneClass"])
+    var = np.asarray(grid.cell_data[var_name], dtype=np.float64)
+    global_mean = float(var[zone_class > 0].mean())
+
+    log(f"reloaded existing results from {out_dir}")
+    return CaseResult(case_name=case.root.name, var_name=var_name, t_sel=float("nan"),
+                      global_mean=global_mean, class_rows=class_rows,
+                      class_means=class_means, out_dir=out_dir, model=model, het=het)
+
+
 def run_batch(args) -> None:
     root = args.case
     if not root.is_dir():
@@ -1679,9 +1765,21 @@ def run_batch(args) -> None:
         model = parse_input_xml(case.input_xml, case.stl_files)
         base = (args.output_dir / case.root.name) if args.output_dir else case.root / "zoner_output"
         for v in args.variable:
+            out_dir = case_out_dir(base, args.variable, v)
             try:
-                results[v].append(run_case(case, model, v, args,
-                                           case_out_dir(base, args.variable, v)))
+                if args.comparison_only:
+                    # earlier runs may have used the other layout (flat vs per-variable)
+                    alt_dir = base / var_slug(v) if out_dir == base else base
+                    r = (load_case_result(case, model, out_dir)
+                         or load_case_result(case, model, alt_dir))
+                    if r is None:
+                        warn(f"case '{case.root.name}', variable '{v}': no existing "
+                             f"results in {out_dir} or {alt_dir}; skipping (rerun "
+                             f"without --comparison-only to generate them)")
+                    else:
+                        results[v].append(r)
+                else:
+                    results[v].append(run_case(case, model, v, args, out_dir))
             except (Exception, SystemExit) as e:  # keep the batch alive on bad cases
                 warn(f"case '{case.root.name}', variable '{v}' failed: {e}")
 
@@ -1710,6 +1808,9 @@ def main(argv=None):
     ap.add_argument("--batch", action="store_true",
                     help="process every case subdirectory under 'case' and compare "
                          "zones across cases")
+    ap.add_argument("--comparison-only", action="store_true",
+                    help="with --batch: reuse existing per-case zoner_output data "
+                         "and regenerate only the cross-case comparison")
     ap.add_argument("--variable", nargs="+", default=["edr"],
                     help="variable(s) to analyze (fuzzy match, e.g. 'edr', 'shear', 'tke')")
     ap.add_argument("--n-zones", type=int, default=None,
@@ -1767,6 +1868,8 @@ def main(argv=None):
         fail("--n-zones must be >= 2")
     if args.log_base <= 1:
         fail("--log-base must be > 1")
+    if args.comparison_only and not args.batch:
+        fail("--comparison-only requires --batch")
 
     if args.batch:
         run_batch(args)
