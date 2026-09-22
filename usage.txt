@@ -16,6 +16,7 @@ python cfd_zoner.py <case_dir> --variable edr --n-zones 4   # fixed zone count
 python cfd_zoner.py <case_dir> --variable shear             # auto zone count
 python cfd_zoner.py <case_dir> --variable edr --time 8      # manual time point
 python cfd_zoner.py <case_dir> --variable edr shear tke     # several variables
+python cfd_zoner.py <case_dir> --variable Scalar_TracerContinuous  # Scalar Field object
 python cfd_zoner.py <case_dir> --list-vars                  # show available arrays
 python cfd_zoner.py <case_dir> --html --no-plots            # interactive 3D HTML only
 python cfd_zoner.py <case_dir> --log-bins                   # order-of-magnitude zones
@@ -43,7 +44,9 @@ Options
                           are skipped with a warning
 --variable VAR [VAR ...]  variable(s) to analyze, fuzzy match (default: edr)
                           aliases: edr, tke, velocity, shear, tracer,
-                          kolmogorov, micromixing
+                          kolmogorov, micromixing. Underscored M-Star Scalar
+                          Field object names are accepted; their steady trace,
+                          global mean, and RSD come from Stats/Scalar_<name>.txt
 --n-zones N               total zones incl. impeller; omit for automatic
                           selection via silhouette score (default: auto)
 --time T                  analysis time [s]; overrides steady-state detection
@@ -90,6 +93,7 @@ Outputs (written to the output directory)
 -----------------------------------------
 zones.csv                 per-zone and per-sub-zone statistics
 heterogeneity.csv         local-vs-global significance metrics (see below)
+                          incl. M-Star scalar global mean/RSD when available
 zones.vti                 labeled grid (ZoneClass, ZoneID) for ParaView
 time_trace.png            stats trace with steady-state and analysis markers
 histogram.png             value distribution with class boundaries and means

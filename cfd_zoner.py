@@ -38,9 +38,9 @@ VAR_ALIASES = {
 
 
 def norm_name(s: str) -> str:
-    """Lowercase and strip unit suffixes like '(W/kg)' or '[W/kg]'."""
+    """Normalize separators and strip unit suffixes like '(W/kg)' or '[W/kg]'."""
     s = re.sub(r"[\[\(][^\]\)]*[\]\)]", "", s)
-    return re.sub(r"\s+", " ", s).strip().lower()
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
 
 
 def var_unit(var_name: str) -> str:
@@ -98,6 +98,7 @@ class Case:
     vti_series: list[tuple[float, Path]] = field(default_factory=list)
     stats_fluid: Path | None = None
     stats_power: Path | None = None
+    stats_scalars: list[Path] = field(default_factory=list)
     stl_files: list[Path] = field(default_factory=list)
 
 
@@ -192,6 +193,7 @@ def discover_case(root: Path) -> Case:
     case.stats_fluid = fluid[0] if fluid else None
     power = sorted(stats_root.glob("MovingBody_*.txt")) or _rglob(root, "MovingBody_*.txt")
     case.stats_power = power[0] if power else None
+    case.stats_scalars = sorted(stats_root.glob("Scalar_*.txt")) or _rglob(root, "Scalar_*.txt")
 
     case.stl_files = sorted(root.glob("*.stl")) or _rglob(root, "*.stl")
     return case
@@ -279,6 +281,43 @@ def find_column(header: list[str], target: str) -> int | None:
     return None
 
 
+def find_scalar_stats(case: Case, var_query: str) -> Path | None:
+    """Find the standalone M-Star Scalar_<object>.txt matching a field query."""
+    query = norm_name(var_query)
+    query_core = re.sub(r"\b(concentration|conc)\b", "", query).strip()
+    matches = []
+    for path in case.stats_scalars:
+        stem = norm_name(path.stem)
+        if query == stem or query_core == stem or query in stem or stem in query_core:
+            matches.append(path)
+    if len(matches) > 1:
+        warn(f"multiple scalar stats files match '{var_query}'; using {matches[0].name}")
+    return matches[0] if matches else None
+
+
+def scalar_stats_at_time(case: Case, var_query: str, target_time: float) -> dict | None:
+    """Return M-Star's scalar mean and RSD nearest the selected VTI time."""
+    path = find_scalar_stats(case, var_query)
+    if path is None:
+        return None
+    header, data = load_stats_table(path)
+    mean_col = find_column(header, "conc mean")
+    if mean_col is None:
+        mean_col = find_column(header, "mean")
+    rsd_col = find_column(header, "conc rsd")
+    if rsd_col is None:
+        rsd_col = find_column(header, "rsd")
+    if mean_col is None:
+        warn(f"no mean column found in {path.name}")
+        return None
+    idx = int(np.argmin(np.abs(data[:, 0] - target_time)))
+    result = {"time_s": float(data[idx, 0]), "mean": float(data[idx, mean_col]),
+              "source": path.name}
+    if rsd_col is not None:
+        result["rsd_percent"] = float(data[idx, rsd_col])
+    return result
+
+
 def steady_trace_from_stats(case: Case, var_query: str, steady_on: str) -> tuple[np.ndarray, np.ndarray, str] | None:
     """Return (times, values, label) or None if no usable stats file."""
     qn = VAR_ALIASES.get(var_query.lower().strip(), norm_name(var_query))
@@ -290,13 +329,20 @@ def steady_trace_from_stats(case: Case, var_query: str, steady_on: str) -> tuple
         col = find_column(header, "power number")
         src = case.stats_power
     else:
-        if case.stats_fluid is None:
+        src = find_scalar_stats(case, var_query)
+        if src is not None:
+            header, data = load_stats_table(src)
+            col = find_column(header, "conc mean")
+            if col is None:
+                col = find_column(header, "mean")
+        elif case.stats_fluid is not None:
+            header, data = load_stats_table(case.stats_fluid)
+            col = find_column(header, f"mean {qn}")
+            if col is None:
+                col = find_column(header, qn)
+            src = case.stats_fluid
+        else:
             return None
-        header, data = load_stats_table(case.stats_fluid)
-        col = find_column(header, f"mean {qn}")
-        if col is None:
-            col = find_column(header, qn)
-        src = case.stats_fluid
     if col is None:
         warn(f"no matching column in {src.name}")
         return None
@@ -752,10 +798,14 @@ def report_heterogeneity(het: dict, var_name: str, out_csv: Path,
     print(f"  CV = {het['cv']:.3f}   sigma(log10) = {het['sigma_log10']:.3f}   "
           f"P95/P50 = {het['p95_over_p50']:.2f}   P99/mean = {het['p99_over_mean']:.2f}")
     print(f"  between-zone variance fraction eta^2 = {het['eta2_between_zone']:.3f}   "
-          f"zone contrast = {het['zone_contrast']:.2f}   "
-          f"gradient index = {het['grad_index']:.3f}")
-    print(f"  => local-vs-global gradients {verdict} "
-          f"(criteria: eta^2 >= {eta2_thr} and zone contrast >= {contrast_thr})")
+            f"zone contrast = {het['zone_contrast']:.2f}   "
+            f"gradient index = {het['grad_index']:.3f}")
+    if "mstar_global_mean" in het:
+        rsd = (f"   RSD = {het['mstar_rsd_percent']:.3f}%" if "mstar_rsd_percent" in het else "")
+        print(f"  M-Star scalar stats: global mean = {het['mstar_global_mean']:.6g}{rsd} "
+              f"at t = {het['mstar_stats_time_s']:.3g} s")
+        print(f"  => local-vs-global gradients {verdict} "
+            f"(criteria: eta^2 >= {eta2_thr} and zone contrast >= {contrast_thr})")
 
 
 @dataclass
@@ -1217,6 +1267,16 @@ def run_case(case: Case, model: ModelInfo, variable: str, args, out_dir: Path) -
     report(rows, fld.var_name, out_dir / "zones.csv")
     het = heterogeneity_stats(fld, fluid, zone_class, model,
                               args.eta2_threshold, args.contrast_threshold)
+    scalar_stats = scalar_stats_at_time(case, variable, t_sel)
+    if scalar_stats is not None:
+        het["mstar_stats_time_s"] = scalar_stats["time_s"]
+        het["mstar_global_mean"] = scalar_stats["mean"]
+        if "rsd_percent" in scalar_stats:
+            het["mstar_rsd_percent"] = scalar_stats["rsd_percent"]
+        log(f"scalar stats from {scalar_stats['source']} at t={scalar_stats['time_s']:.3g} s: "
+            f"mean={scalar_stats['mean']:.6g}"
+            + (f", RSD={scalar_stats['rsd_percent']:.3g}%"
+               if "rsd_percent" in scalar_stats else ""))
     report_heterogeneity(het, fld.var_name, out_dir / "heterogeneity.csv",
                          args.eta2_threshold, args.contrast_threshold)
     write_labeled_vti(fld, zone_class, zone_id, out_dir / "zones.vti")
@@ -1226,8 +1286,10 @@ def run_case(case: Case, model: ModelInfo, variable: str, args, out_dir: Path) -
     if not args.no_render:
         render_3d(out_dir, fld, zone_class, model, show=args.show, html=args.html,
                   class_means=class_means)
+    global_mean = (scalar_stats["mean"] if scalar_stats is not None
+                   else float(fld.var[fluid].mean()))
     return CaseResult(case_name=case.root.name, var_name=fld.var_name, t_sel=t_sel,
-                      global_mean=float(fld.var[fluid].mean()),
+                      global_mean=global_mean,
                       class_rows=[(c, name, s) for level, c, name, s in rows
                                   if level == "class"],
                       class_means=class_means, out_dir=out_dir, model=model, het=het)
@@ -1728,7 +1790,7 @@ def load_case_result(case: Case, model: ModelInfo, out_dir: Path) -> CaseResult 
     grid = pv.read(str(zones_vti))
     zone_class = np.asarray(grid.cell_data["ZoneClass"])
     var = np.asarray(grid.cell_data[var_name], dtype=np.float64)
-    global_mean = float(var[zone_class > 0].mean())
+    global_mean = float(het.get("mstar_global_mean", var[zone_class > 0].mean()))
 
     log(f"reloaded existing results from {out_dir}")
     return CaseResult(case_name=case.root.name, var_name=var_name, t_sel=float("nan"),

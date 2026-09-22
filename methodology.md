@@ -22,12 +22,16 @@ VTI field --> 1. fluid mask --> 2. impeller zone --> 3. log k-means --> 4. spati
 
 ### 1.1 Analysis timestep
 
-Before zoning, the analysis time is chosen from the M-Star stats files
-(out/Stats/Fluid.txt): the first time from which the windowed mean of the
-variable (or power number with `--steady-on power`) stops drifting by more
-than `--tol` per `--window`, persisting to the end of the trace. The first
-VTI at or after that time is analyzed (`--time` overrides). time_trace.png
-shows the trace with the detected steady point and the selected VTI marked.
+Before zoning, the analysis time is chosen from the M-Star stats files. Flow
+variables use `out/Stats/Fluid.txt`; Scalar Field objects use the matching
+`out/Stats/Scalar_<object>.txt` and its `Conc Mean` column. The first time from
+which the windowed mean (or power number with `--steady-on power`) stops
+drifting by more than `--tol` per `--window`, persisting to the end of the
+trace, is selected. The first VTI at or after that time is analyzed (`--time`
+overrides). `time_trace.png` shows the trace with the detected steady point
+and the selected VTI marked. For scalar objects, M-Star's selected-time global
+mean and RSD are also written to `heterogeneity.csv` and used as the case
+global mean in batch comparisons.
 
 ### 1.2 Fluid mask
 
