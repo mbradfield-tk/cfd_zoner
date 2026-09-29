@@ -1027,26 +1027,32 @@ def make_plots(out_dir: Path, fld: Field3D, fluid: np.ndarray, zone_class: np.nd
                            f"Zone mean as % of global mean ({desc})",
                            f"zone_pct_slice{suf}.png")
 
-    # volume-exposure curve: what fraction of the batch sees <= a given value
+    # volume-exposure curve: interactive Plotly HTML (click legend to show/hide)
+    import plotly.graph_objects as go
     sv = np.sort(vals.astype(np.float64))
     idx = np.linspace(0, sv.size - 1, min(4000, sv.size)).astype(int)
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.plot(sv[idx], 100 * (idx + 1) / sv.size, lw=1.5, color="steelblue")
-    if (sv > 0).any():
-        ax.set_xscale("log")
-    ax.axvline(overall_mean, color="k", ls="--", lw=1,
-               label=f"global mean ({overall_mean:.3g}{unit})")
+    pfig = go.Figure()
+    pfig.add_trace(go.Scatter(x=sv[idx], y=100 * (idx + 1) / sv.size, mode="lines",
+                              name="fluid volume CDF",
+                              line=dict(color="#4682b4", width=2)))
+
+    def add_vline(x, name, color, dash):
+        # vertical lines as traces (not shapes) so they appear in / toggle from the legend
+        pfig.add_trace(go.Scatter(x=[x, x], y=[0, 100], mode="lines", name=name,
+                                  line=dict(color=color, dash=dash, width=1.5)))
+
+    add_vline(overall_mean, f"global mean ({overall_mean:.3g}{unit})", "#000000", "dash")
     if class_means:
         for c in sorted(class_means):
-            ax.axvline(class_means[c], color=colors[c], ls=":", lw=1.5,
-                       label=zone_label(c, class_means, unit))
-    ax.set_xlabel(fld.var_name)
-    ax.set_ylabel("cumulative fluid volume [%]")
-    ax.set_title("Volume exposure: fraction of fluid at or below a value")
-    ax.legend(fontsize=8)
-    fig.tight_layout()
-    fig.savefig(out_dir / "exposure_cdf.png", dpi=150)
-    plt.close(fig)
+            add_vline(class_means[c], zone_label(c, class_means, unit), _hex(colors[c]), "dot")
+    pfig.update_layout(template="simple_white", width=950, height=520,
+                       title="Volume exposure: fraction of fluid at or below a value",
+                       xaxis_title=fld.var_name,
+                       yaxis_title="cumulative fluid volume [%]",
+                       legend=dict(font=dict(size=10)))
+    if (sv > 0).any():
+        pfig.update_xaxes(type="log")
+    write_interactive_html(pfig, out_dir / "exposure_cdf.html")
 
     # axial & radial profiles: where the gradients sit macroscopically
     X, Y, Z = fld.cell_centers_3d()
@@ -1465,6 +1471,47 @@ def fig_to_html(fig, title: str, out_path: Path) -> None:
     log(f"wrote {out_path}")
 
 
+def _hex(rgba) -> str:
+    """Matplotlib RGBA floats (0-1) -> '#rrggbb' for Plotly / HTML color inputs."""
+    return "#{:02x}{:02x}{:02x}".format(*(int(round(255 * v)) for v in rgba[:3]))
+
+
+def write_interactive_html(fig, out_path: Path, color_pickers: bool = True) -> None:
+    """Standalone Plotly HTML: click legend to show/hide, double-click to isolate,
+    plus an optional per-series color picker row below the plot."""
+    html = fig.to_html(
+        full_html=True,
+        include_plotlyjs=True,  # embeds plotly.js (~3.5 MB) so it works offline; "cdn" = small file
+        div_id="plot",
+        config={"editable": True, "displaylogo": False,
+                "toImageButtonOptions": {"format": "svg", "filename": out_path.stem}},
+    )
+    if color_pickers:
+        picker_js = """
+<div id="pickers" style="font:12px sans-serif;padding:8px 16px"></div>
+<script>
+window.addEventListener('load', () => {
+  const gd = document.getElementById('plot');
+  const box = document.getElementById('pickers');
+  gd.data.forEach((tr, i) => {
+    if (!tr.line || !tr.line.color) return;
+    const lab = document.createElement('label');
+    lab.style.cssText = 'margin-right:14px;white-space:nowrap';
+    const inp = document.createElement('input');
+    inp.type = 'color';
+    inp.value = tr.line.color;
+    inp.oninput = e => Plotly.restyle(gd, {'line.color': e.target.value}, [i]);
+    lab.append(inp, ' ' + tr.name);
+    box.append(lab);
+  });
+});
+</script>
+"""
+        html = html.replace("</body>", picker_js + "</body>")
+    out_path.write_text(html, encoding="utf-8")
+    log(f"wrote {out_path}")
+
+
 def _case_grid(n: int):
     ncols = min(3, n)
     return ncols, -(-n // ncols)
@@ -1663,32 +1710,36 @@ def batch_html_2d_normalized(results: list[CaseResult], out_path: Path) -> None:
 
 
 def batch_exposure_cdf(results: list[CaseResult], out_path: Path) -> None:
-    """Combined volume-exposure curves of all cases (values reloaded from zones.vti)."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    """Combined volume-exposure curves of all cases as interactive Plotly HTML
+    (values reloaded from zones.vti). Click legend entries to show/hide."""
+    import plotly.graph_objects as go
+    from plotly.colors import qualitative
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    palette = qualitative.Plotly  # hex colors; swap for qualitative.D3, .Set1, etc.
+    fig = go.Figure()
     any_pos = False
-    for r in results:
+    for i, r in enumerate(results):
         grid, zone_class, _ = load_zone_class(r)
         var = np.asarray(grid.cell_data[r.var_name]).reshape(zone_class.shape)
         v = np.sort(var[zone_class > 0].astype(np.float64))
-        if (v > 0).any():
-            any_pos = True
+        any_pos |= bool((v > 0).any())
         idx = np.linspace(0, v.size - 1, min(4000, v.size)).astype(int)
-        line, = ax.plot(v[idx], 100 * (idx + 1) / v.size, lw=1.5, label=r.case_name)
-        ax.axvline(r.global_mean, color=line.get_color(), ls="--", lw=1)
+        color = palette[i % len(palette)]
+        fig.add_trace(go.Scatter(x=v[idx], y=100 * (idx + 1) / v.size, mode="lines",
+                                 name=r.case_name, legendgroup=r.case_name,
+                                 line=dict(color=color, width=2)))
+        fig.add_trace(go.Scatter(x=[r.global_mean] * 2, y=[0, 100], mode="lines",
+                                 name=f"{r.case_name} global mean ({r.global_mean:.3g})",
+                                 legendgroup=r.case_name,
+                                 line=dict(color=color, dash="dash", width=1)))
+    fig.update_layout(template="simple_white", width=950, height=560,
+                      title="Volume exposure by case (dashed: case global means)",
+                      xaxis_title=results[0].var_name,
+                      yaxis_title="cumulative fluid volume [%]",
+                      legend=dict(font=dict(size=10), groupclick="toggleitem"))
     if any_pos:
-        ax.set_xscale("log")
-    ax.set_xlabel(results[0].var_name)
-    ax.set_ylabel("cumulative fluid volume [%]")
-    ax.set_title("Volume exposure by case (dashed: case global means)")
-    ax.legend(fontsize=8)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    log(f"wrote {out_path}")
+        fig.update_xaxes(type="log")
+    write_interactive_html(fig, out_path)
 
 
 def batch_html_3d(results: list[CaseResult], out_path: Path) -> None:
@@ -1855,7 +1906,7 @@ def run_batch(args) -> None:
         batch_html_2d(results[v], comp_dir / "zones_2d.html")
         batch_html_2d_common(results[v], comp_dir / "zones_2d_common.html")
         batch_html_2d_normalized(results[v], comp_dir / "zones_2d_normalized.html")
-        batch_exposure_cdf(results[v], comp_dir / "exposure_cdf.png")
+        batch_exposure_cdf(results[v], comp_dir / "exposure_cdf.html")
         batch_html_3d(results[v], comp_dir / "zones_3d.html")
 
 
