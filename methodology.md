@@ -20,31 +20,77 @@ VTI field --> 1. fluid mask --> 2. impeller zone --> 3. log k-means --> 4. spati
                                   always class 1)                          sub-zones)
 ```
 
-### 1.1 Analysis timestep
+### 1.1 Analysed field: steady start and time averaging
 
-Before zoning, the analysis time is chosen from the M-Star stats files. Flow
-variables use `out/Stats/Fluid.txt`; Scalar Field objects use the matching
-`out/Stats/Scalar_<object>.txt` and its `Conc Mean` column. The first time from
-which the windowed mean (or power number with `--steady-on power`) stops
-drifting by more than `--tol` per `--window`, persisting to the end of the
-trace, is selected. The first VTI at or after that time is analyzed (`--time`
-overrides). `time_trace.png` shows the trace with the detected steady point
-and the selected VTI marked. For scalar objects, M-Star's selected-time global
-mean and RSD are also written to `heterogeneity.csv` and used as the case
-global mean in batch comparisons.
+Before zoning, the start of the steady state is found from the M-Star stats
+files. Flow variables use `out/Stats/Fluid.txt` (the `velocity` alias uses
+`Mean Velocity`); Scalar Field objects use the matching
+`out/Stats/Scalar_<object>.txt` and its `Conc Mean` column (`--steady-on power`
+uses the power number). Each sample is steady when the mean of the trailing
+`--window` differs from the mean of the window before it by less than `--tol`.
+Strictly, the plateau starts at the first steady sample after which every
+sample is steady. Short excursions are tolerated in a plateau long enough to
+judge them: an unsteady run is a series of consecutive unsteady samples; a run
+spanning at least `--window` is a real change and the plateau starts after the
+last such run, at the first steady sample from which at most 10 % of the samples
+up to the end of the trace are unsteady and at least 10 windows of trace
+remain. If neither start exists, or the plateau found is shorter than two
+windows (the span the test itself compares, e.g. a quiet last second of a
+fluctuating trace), no plateau is reported (the steady start stays
+blank in `zoner_summary.csv` and `time_trace.csv`) and the last 25 % of the
+trace's time span is used instead. `--time` sets the start time by hand.
+
+What is analysed from that time on:
+
+- The variable has a `Time-Avg` variant in the VTI (and `--instantaneous` is not
+  given): that array is taken from the **last** frame of the series, the most
+  averaged one.
+- Otherwise the instantaneous field is **averaged over every frame from the
+  start time to the last frame** (running sums, one frame in memory at a time).
+  A cell counts as fluid when its velocity magnitude is non-zero in at least half
+  of these frames; its value is the mean over the frames in which it was fluid.
+- `--instantaneous`: one frame only, the first at or after the start time (the
+  last frame when no plateau was found). Statistics of a single snapshot of a
+  turbulent field scatter from frame to frame and are more extreme than those of
+  the mean field.
+
+`zoner_summary.csv` reports the analysis time (last frame used), the averaging
+start and the number of frames averaged (1 for a single frame). `time_trace.png`
+shows the trace with the detected steady point and the analysis time marked. For
+scalar objects, M-Star's global mean and RSD at the analysis time are also
+written to `heterogeneity.csv` and used as the case global mean in batch
+comparisons.
+
+Multi-GPU solves write one piece of the grid per GPU (`Volume/block0`, `block1`,
+...). The same-named files of all blocks are assembled into one grid by their
+origins; a frame that is missing in one block is an error.
 
 ### 1.2 Fluid mask
 
 Selects the cells all later steps operate on:
 
 - Cells with zero velocity magnitude are excluded (M-Star writes exact zeros
-  for solid/exterior cells).
-- Cells inside the moving-body STL (impeller + shaft) are excluded: unlike
+  for solid/exterior cells and for the gas above a free surface). Together with
+  the moving-body cells these are the cells M-Star counts in `Fluid.txt` (fluid
+  volume, volume means).
+- Cells inside the moving body (impeller + shaft) are excluded: unlike
   static bodies, moving-body cells carry the solid's velocity, so the
-  zero-velocity blanking does not catch them.
-- The fill-level STL from input.xml restricts to the liquid. Box-like meshes
-  use a fast axis-aligned bounds test; arbitrary shapes use a
-  point-in-surface test.
+  zero-velocity blanking does not catch them. The body is taken in the pose of
+  the analysed frame from M-Star's posed mesh
+  (`out/Output/VolumeMovingBody_<name>/block*/*.<time>.vtp`): the impeller STL,
+  placed as in input.xml (`<scale>` and `<transform>` matrix), is turned about
+  the rotation axis until its vertices lie on that mesh, which gives the same
+  cells as the much finer posed mesh itself (used directly if no such rotation
+  exists). When a field is averaged over several frames this is done per frame:
+  a cell swept by a blade is not fluid in the frames in which it is inside the
+  body, and its value is the mean over the other frames. Without posed-mesh
+  output the placed STL in its initial pose is used.
+- The fill-level STL from input.xml is **not** used when a velocity magnitude
+  array is available: it is only the initial region of one fluid (the lower
+  layer of a two-fluid case, the liquid at rest of a free-surface case). It
+  remains the fallback for files without a usable velocity magnitude array:
+  box-like meshes use a fast axis-aligned bounds test, arbitrary shapes a
+  point-in-surface test. The log says which mask was used.
 
 ### 1.3 Impeller zone (always class 1)
 
@@ -52,15 +98,20 @@ The impeller region is defined **geometrically**, not by clustering, because
 it is the mechanistically distinct compartment regardless of the variable:
 
 - From the impeller STL + rotation axis (input.xml): a swept cylinder around
-  the axis. Radius = max blade radius; axial span from the blade region only
-  (so an included shaft does not stretch the zone); both padded by
+  the rotation axis, i.e. the line through the `<pivot>` of input.xml along
+  `<rotationAxis>` (without a pivot: through the centre of the STL's bounding
+  box, which is off the axis for e.g. three-bladed impellers). The STL is
+  placed as in input.xml (`<scale>`, `<transform>` matrix). Radius = largest
+  distance of the STL vertices from that line; axial span from the blade region
+  only (so an included shaft does not stretch the zone); both padded by
   `--impeller-pad` (default 15%).
 - Fallback without geometry: the largest connected blob of top-percentile
   velocity cells (`--impeller-percentile`), as a fitted cylinder or the raw
   blob (`--impeller-shape`).
 
-The impeller zone is excluded from clustering and never merged. Disable it
-with `--no-impeller-zone`.
+The impeller zone is excluded from clustering, is never merged and takes no
+merged fragments: it stays the geometric cylinder. Disable it with
+`--no-impeller-zone`.
 
 ### 1.4 Value clustering (classes 2+)
 
@@ -71,7 +122,10 @@ with `--no-impeller-zone`.
   are reproducible) and all cells are assigned to the nearest cluster.
 - Classes are ordered so **class 1 = highest values**. Class boundaries are
   the midpoints between adjacent cluster centers, mapped back to value space
-  (the dashed lines on histogram.png).
+  (the dashed lines on histogram.png). `class_boundaries.csv` lists, per zone,
+  the upper boundary of its value class: blank for the impeller zone and for
+  the highest value class; with `--log-bins` it is the upper edge of the bin,
+  listed only for the classes that exist after merging.
 
 #### Automatic zone count (auto-k)
 
@@ -100,8 +154,9 @@ Value classes are converted into physically meaningful compartments:
 - Each class is split into connected components (26-neighbor connectivity):
   the same value band above vs below the impeller becomes separate sub-zones.
 - Fragments smaller than `--min-zone-frac` (default 0.5% of fluid volume)
-  are absorbed into their most common neighboring class, removing turbulent
-  speckle so sub-zones are meaningful compartments.
+  are absorbed into their most common neighboring value class (never into the
+  impeller zone), removing turbulent speckle so sub-zones are meaningful
+  compartments.
 
 Two labelings result, both written to zones.vti and reported in zones.csv:
 
@@ -160,12 +215,19 @@ near eta2 ~ 0.4-0.5 with very high contrast, which merits a human look
 
 ### 2.3 Diagnostic plots (per case)
 
+Every figure's data is always written as CSV next to it (`time_trace.csv`,
+`histogram.csv`, `exposure_cdf.csv`, `class_boundaries.csv`, `zone_weights.csv`,
+`profiles.csv`, `zone_slices.csv` + `zone_slice_<side|side2|top>.csv` with the
+ZoneClass matrices, `zoner_summary.csv` with the scalar results); the PNG/HTML
+figures below are skipped with `--no-plots`. M-Star Post runs the script that way
+and draws the same figures itself (Plots > Zones), for all cases of a project.
+
 | File | What it shows | How to read it |
 |------|---------------|----------------|
 | histogram.png | value distribution + class boundaries + zone means | Deep valleys between boundaries = natural bands; smooth continuum = zoning slices arbitrarily |
 | exposure_cdf.png | cumulative fluid volume vs value | "What fraction of the batch sees <= X?"; steep curve = homogeneous, wide S = heterogeneous. Read process limits off it directly (e.g. % of volume above a shear-damage threshold) |
 | profiles.png | volume-averaged axial and radial profiles | Locates the gradients: an impeller-height peak means discharge-dominated; a monotonic axial slope means top-to-bottom stratification |
-| zone_slice*.png | 2D zone maps (side/top cross-sections) | Where the compartments sit; sanity-check the impeller cylinder and sub-zone splits |
+| zone_slice*.png | 2D zone maps (side/top cross-sections) | Where the compartments sit; sanity-check the impeller cylinder and sub-zone splits. The side views are cut through the impeller axis (the `<pivot>` of input.xml; the fluid centroid when there is no impeller), the top view through the impeller-zone centre; `zone_slices.csv` gives each plane's coordinate |
 | zone_pct_slice*.png | zone mean as % of global mean | Same maps normalized to the tank average (100% = average) |
 | zone_weights.png | volume fraction vs contribution to the mean | A zone with 15% of volume contributing 50% of the mean is a "hot spot" driving the average |
 | zones_3d.png / .html / .glb | 3D cutaway rendering | Static image, interactive browser view, and PowerPoint-insertable 3D model |
@@ -174,7 +236,9 @@ near eta2 ~ 0.4-0.5 with very high contrast, which merits a human look
 
 Zones are clustered per case and aligned **by rank** (impeller vs impeller,
 class 1 vs class 1). Absolute boundaries differ between cases; normalized
-quantities (mean / case global mean) are the fair comparison.
+quantities (mean / case global mean) are the fair comparison. (In M-Star Post the
+same comparison is built from the per-case CSVs of all CFD zoner runs of a
+project, newest run per case; the stand-alone batch mode writes these files.)
 
 | File | What it shows |
 |------|---------------|

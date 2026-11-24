@@ -2,8 +2,10 @@
 """Zonal analysis of M-Star CFD volume (VTI) output.
 
 Reads an M-Star results directory in its native layout (case/input.xml,
-case/*.stl, case/out/Stats/, case/out/Output/Volume/block*/*.vti),
-finds momentum steady state (or uses a user-defined time), always defines an
+case/*.stl, case/out/Stats/, case/out/Output/Volume/block*/*.vti; the blocks of a
+multi-GPU solve are merged into one grid), finds momentum steady state (or uses a
+user-defined time), analyses the Time-Avg array of the last frame or else the average
+of the instantaneous field over the frames from the steady start on, always defines an
 impeller zone, clusters the selected variable into value-based zones (log-scale
 k-means) split into spatially contiguous sub-zones, and reports per-zone stats,
 a labeled VTI for ParaView, diagnostic plots, and a 3D rendering.
@@ -14,6 +16,12 @@ Example:
 """
 
 from __future__ import annotations
+
+import os
+
+# before numpy is imported: BLAS/OpenMP thread pools oversubscribe a many-core host
+for _threads in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_threads, "4")
 
 import argparse
 import csv
@@ -114,6 +122,28 @@ def _rglob(root: Path, pattern: str) -> list[Path]:
                   if not SKIP_DIRS.intersection(f.parts))
 
 
+# multi-GPU solves write one piece per GPU: block0, block1, ... (same file names)
+BLOCK_RE = re.compile(r"^block(\d+)$", re.IGNORECASE)
+
+
+def block_dirs(parent: Path) -> list[Path]:
+    dirs = [d for d in parent.iterdir() if d.is_dir() and BLOCK_RE.match(d.name)]
+    return sorted(dirs, key=lambda d: int(BLOCK_RE.match(d.name).group(1)))
+
+
+def block_files(path: Path) -> list[Path]:
+    """The same-named file of every blockN folder next to path's own block folder;
+    [path] for single-block output. A frame missing in one block is an error."""
+    if not BLOCK_RE.match(path.parent.name):
+        return [path]
+    files = [d / path.name for d in block_dirs(path.parent.parent)]
+    missing = [f.parent.name for f in files if not f.is_file()]
+    if missing:
+        fail(f"frame {path.name} is incomplete: no such file in {', '.join(missing)} "
+             f"(found in {len(files) - len(missing)} of {len(files)} blocks)")
+    return files
+
+
 def read_pvd_times(pvd: Path) -> dict[Path, float]:
     """Map VTI paths to timesteps from a ParaView collection (.pvd) file."""
     import xml.etree.ElementTree as ET
@@ -130,9 +160,7 @@ def read_pvd_times(pvd: Path) -> dict[Path, float]:
 
 
 def build_vti_series(vti_files: list[Path], pvd_files: list[Path]) -> list[tuple[float, Path]]:
-    pvd_times: dict[Path, float] = {}
-    for pvd in pvd_files:
-        pvd_times.update(read_pvd_times(pvd))
+    pvd_times: dict[Path, float] | None = None  # parsed only for names without a time
 
     series = []
     unparsed = []
@@ -140,7 +168,12 @@ def build_vti_series(vti_files: list[Path], pvd_files: list[Path]) -> list[tuple
         m = TIME_RE.search(f.stem)
         if m:
             series.append((float(m.group(1)), f))
-        elif f.resolve() in pvd_times:
+            continue
+        if pvd_times is None:
+            pvd_times = {}
+            for pvd in pvd_files:
+                pvd_times.update(read_pvd_times(pvd))
+        if f.resolve() in pvd_times:
             series.append((pvd_times[f.resolve()], f))
         else:
             unparsed.append(f)
@@ -175,11 +208,10 @@ def discover_case(root: Path) -> Case:
     # slice/checkpoint VTIs in a full M-Star results directory are not swept in
     volume_dir = root / "out" / "Output" / "Volume"
     if volume_dir.is_dir():
-        blocks = sorted(d for d in volume_dir.iterdir()
-                        if d.is_dir() and d.name.startswith("block"))
+        blocks = block_dirs(volume_dir)
         if len(blocks) > 1:
-            warn(f"multiple volume blocks ({', '.join(b.name for b in blocks)}); "
-                 f"using {blocks[0].name} only")
+            log(f"{len(blocks)} volume blocks ({', '.join(b.name for b in blocks)}): "
+                f"merged into one grid per frame")
         vti_files = sorted((blocks[0] if blocks else volume_dir).glob("*.vti"))
         pvd_files = sorted(volume_dir.parent.glob("*.pvd"))
     else:
@@ -209,6 +241,10 @@ class ModelInfo:
     impeller_rpm: float | None = None
     fluid_stl: Path | None = None
     context_stls: list[Path] = field(default_factory=list)
+    impeller_name: str | None = None
+    impeller_scale: float = 1.0
+    impeller_matrix: np.ndarray | None = None  # <transform> 4x4, row vectors: p' = [p, 1] @ M
+    impeller_pivot: np.ndarray | None = None   # a point on the rotation axis
 
 
 def find_stl(name: str, stl_files: list[Path]) -> Path | None:
@@ -216,6 +252,14 @@ def find_stl(name: str, stl_files: list[Path]) -> Path | None:
         if f.name.lower() == name.lower():
             return f
     return None
+
+
+def _floats(text: str | None, n: int) -> np.ndarray | None:
+    try:
+        v = np.array([float(x) for x in (text or "").split()])
+    except ValueError:
+        return None
+    return v if v.size == n else None
 
 
 def parse_input_xml(xml_path: Path | None, stl_files: list[Path]) -> ModelInfo:
@@ -229,6 +273,12 @@ def parse_input_xml(xml_path: Path | None, stl_files: list[Path]) -> ModelInfo:
         if imp is not None:
             stl_name = (imp.findtext("stl") or "").strip()
             info.impeller_stl = find_stl(stl_name, stl_files)
+            info.impeller_name = (imp.findtext("name") or "").strip() or None
+            scale = _floats(imp.findtext("scale"), 1)
+            info.impeller_scale = float(scale[0]) if scale is not None else 1.0
+            matrix = _floats(imp.findtext("transform/matrix4x4"), 16)
+            info.impeller_matrix = matrix.reshape(4, 4) if matrix is not None else None
+            info.impeller_pivot = _floats(imp.findtext("pivot"), 3)
             ax = imp.findtext("rotationAxis")
             if ax:
                 v = np.array([float(x) for x in ax.split()])
@@ -246,6 +296,11 @@ def parse_input_xml(xml_path: Path | None, stl_files: list[Path]) -> ModelInfo:
         log(f"input.xml parsed: impeller={info.impeller_stl.name if info.impeller_stl else None}, "
             f"axis={info.impeller_axis}, D={info.impeller_diameter}, rpm={info.impeller_rpm}, "
             f"fluid={info.fluid_stl.name if info.fluid_stl else None}")
+        if info.impeller_stl is not None and impeller_is_placed(info):
+            m = info.impeller_matrix if info.impeller_matrix is not None else np.eye(4)
+            log(f"impeller STL placed as in input.xml: scale {info.impeller_scale:g}, "
+                f"translation {m[3, :3]}"
+                + ("" if np.allclose(m[:3, :3], np.eye(3)) else ", with rotation"))
     else:
         # filename heuristics fallback
         for f in stl_files:
@@ -258,6 +313,33 @@ def parse_input_xml(xml_path: Path | None, stl_files: list[Path]) -> ModelInfo:
                 claimed.add(f)
     info.context_stls = [f for f in stl_files if f not in claimed]
     return info
+
+
+def impeller_is_placed(model: ModelInfo) -> bool:
+    """True when input.xml scales or transforms the impeller STL."""
+    m = model.impeller_matrix
+    return model.impeller_scale != 1.0 or (m is not None and not np.array_equal(m, np.eye(4)))
+
+
+def load_impeller(model: ModelInfo):
+    """The impeller STL where M-Star puts it (initial pose): scaled, then transformed
+    with the input.xml matrix (row vectors, translation in the last row)."""
+    import pyvista as pv
+
+    mesh = pv.read(str(model.impeller_stl))
+    if impeller_is_placed(model):
+        pts = np.asarray(mesh.points, dtype=np.float64) * model.impeller_scale
+        if model.impeller_matrix is not None:
+            pts = pts @ model.impeller_matrix[:3, :3] + model.impeller_matrix[3, :3]
+        mesh.points = pts
+    return mesh
+
+
+def up_axis(axis: np.ndarray | None) -> np.ndarray:
+    """The shaft direction, pointing to the positive side of its dominant coordinate."""
+    if axis is None:
+        return np.array([0.0, 1.0, 0.0])
+    return -axis if axis[int(np.argmax(np.abs(axis)))] < 0 else axis + 0.0
 
 
 # ---------------------------------------------------------------- stats files
@@ -276,7 +358,7 @@ def find_column(header: list[str], target: str) -> int | None:
     if target in normed:
         return normed.index(target)
     for i, h in enumerate(normed):
-        if target in h and "time-avg" not in h:
+        if target in h and "time avg" not in h:
             return i
     return None
 
@@ -340,6 +422,8 @@ def steady_trace_from_stats(case: Case, var_query: str, steady_on: str) -> tuple
             col = find_column(header, f"mean {qn}")
             if col is None:
                 col = find_column(header, qn)
+            if col is None and qn.endswith(" magnitude"):  # Fluid.txt has 'Mean Velocity [m/s]'
+                col = find_column(header, f"mean {qn[:-len(' magnitude')]}")
             src = case.stats_fluid
         else:
             return None
@@ -350,37 +434,90 @@ def steady_trace_from_stats(case: Case, var_query: str, steady_on: str) -> tuple
     return data[:, 0], data[:, col], header[col]
 
 
-def detect_steady_state(times: np.ndarray, values: np.ndarray, window: float, tol: float) -> float:
-    """First time from which the windowed mean stops drifting (change < tol) for good.
+EXCURSION_SHARE = 0.10  # unsteady samples tolerated inside a plateau of >= window / share
 
-    Compares the mean of the trailing window against the window before it, which
-    tolerates turbulent fluctuations that never settle below tol themselves.
-    """
-    steady_flags = np.zeros(len(times), bool)
-    for i, t in enumerate(times):
+
+def plateau_index(times: np.ndarray, steady: np.ndarray, window: float) -> int | None:
+    """Index of the first sample of the plateau, given the per-sample steady flags
+    (same rule as plateau_index in mstar_stats_summary.py).
+
+    Strictly, the plateau starts at the first steady sample after which every sample is
+    steady. Short excursions are tolerated in a plateau long enough to judge them: runs
+    of unsteady samples lasting less than one window, making up at most EXCURSION_SHARE
+    of the samples of a plateau spanning at least window / EXCURSION_SHARE. A run of a
+    window or longer is a real change and the plateau starts after it. None if there is
+    no plateau."""
+    n = len(times)
+    if n == 0:
+        return None
+    bad = ~steady
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], bad.astype(np.int8), [0]))))
+    first, last = edges[::2], edges[1::2] - 1  # inclusive ends of each unsteady run
+    real = times[last] - times[first] >= window
+    i0 = int(last[real][-1]) + 1 if real.any() else 0
+    share = np.cumsum(bad[::-1])[::-1] / (n - np.arange(n))
+    ok = steady & (share <= EXCURSION_SHARE) & (times[-1] - times >= window / EXCURSION_SHARE)
+    ok[:i0] = False
+    ok |= steady & (share == 0)
+    hit = np.flatnonzero(ok)
+    return int(hit[0]) if hit.size else None
+
+
+def steady_flags(times: np.ndarray, values: np.ndarray, window: float, tol: float) -> np.ndarray:
+    """flags[i]: the mean of the window ending at sample i differs from the mean of the
+    window before it by less than tol (False until two full windows have passed)."""
+    n = len(times)
+    flags = np.zeros(n, bool)
+
+    def one(i: int) -> bool:  # the definition, sample by sample
+        t = times[i]
         cur = (times > t - window) & (times <= t)
         prev = (times > t - 2 * window) & (times <= t - window)
         if t < times[0] + 2 * window or cur.sum() < 3 or prev.sum() < 3:
-            continue
+            return False
         m_cur, m_prev = values[cur].mean(), values[prev].mean()
-        if abs(m_prev) > 0 and abs(m_cur - m_prev) / abs(m_prev) < tol:
-            steady_flags[i] = True
-    # require steadiness to persist to the end of the trace
-    idx = None
-    for i in range(len(times)):
-        if steady_flags[i:].all() and steady_flags[i]:
-            idx = i
-            break
-    if idx is None:
-        warn(f"no steady plateau found (window={window}s, tol={tol}); using last time")
-        return float(times[-1])
-    return float(times[idx])
+        return bool(abs(m_prev) > 0 and abs(m_cur - m_prev) / abs(m_prev) < tol)
+
+    if n < 2 or not np.all(np.diff(times) >= 0):  # unsorted times: no window slices
+        todo = np.arange(n)
+    else:  # window means from one running sum; samples the rounding could flip are redone
+        hi = np.searchsorted(times, times, side="right")
+        mid = np.searchsorted(times, times - window, side="right")
+        lo = np.searchsorted(times, times - 2 * window, side="right")
+        n_cur, n_prev = hi - mid, mid - lo
+        usable = ~(times < times[0] + 2 * window) & (n_cur >= 3) & (n_prev >= 3)
+        total = np.concatenate(([0.0], np.cumsum(values, dtype=np.float64)))
+        err = 4 * n * np.finfo(np.float64).eps * float(np.abs(values).sum())
+        with np.errstate(divide="ignore", invalid="ignore"):
+            m_cur = (total[hi] - total[mid]) / n_cur
+            m_prev = (total[mid] - total[lo]) / n_prev
+            change = np.abs(m_cur - m_prev) / np.abs(m_prev)
+            slack = err / np.minimum(n_cur, n_prev) * (2 + change) / np.abs(m_prev)
+            sure = np.abs(change - tol) > slack
+        flags = usable & sure & (change < tol)
+        todo = np.flatnonzero(usable & ~sure)
+    for i in todo:
+        flags[i] = one(i)
+    return flags
+
+
+def detect_steady_state(times: np.ndarray, values: np.ndarray, window: float,
+                        tol: float) -> float | None:
+    """Start of the steady plateau of the windowed mean (change < tol), or None.
+
+    Compares the mean of the trailing window against the window before it, which
+    tolerates turbulent fluctuations that never settle below tol themselves; short
+    excursions inside a long plateau are tolerated too (plateau_index).
+    """
+    flags = steady_flags(times, values, window, tol)
+    idx = plateau_index(times, flags, window)
+    return None if idx is None else float(times[idx])
 
 
 # ---------------------------------------------------------------- VTI handling
 
-def list_vti_arrays(path: Path) -> list[str]:
-    """Read array names from the XML header without loading the binary payload."""
+def vti_header_text(path: Path) -> str:
+    """The XML header of a .vti file (everything before the binary payload)."""
     head = b""
     with open(path, "rb") as fh:
         while b"<AppendedData" not in head and len(head) < 4_000_000:
@@ -388,13 +525,37 @@ def list_vti_arrays(path: Path) -> list[str]:
             if not chunk:
                 break
             head += chunk
-    return re.findall(r'DataArray[^>]*Name="([^"]+)"', head.decode("utf-8", errors="ignore"))
+    return head.decode("utf-8", errors="ignore")
+
+
+def list_vti_arrays(path: Path) -> list[str]:
+    """Read array names from the XML header without loading the binary payload."""
+    return re.findall(r'DataArray[^>]*Name="([^"]+)"', vti_header_text(path))
+
+
+def scalar_cell_arrays(path: Path) -> list[str]:
+    """Names of the one-component cell arrays in file order, from the XML header."""
+    import html
+
+    sec = re.search(r"<CellData[^>]*>(.*?)</CellData>", vti_header_text(path), re.S)
+    names = []
+    for tag in re.findall(r"<DataArray[^>]*>", sec.group(1)) if sec else []:
+        name = re.search(r'Name="([^"]+)"', tag)
+        ncomp = re.search(r'NumberOfComponents="(\d+)"', tag)
+        if name and (ncomp is None or int(ncomp.group(1)) == 1):
+            names.append(html.unescape(name.group(1)))
+    if names:
+        return names
+    import pyvista as pv  # header not readable this way: load the file once
+
+    grid = pv.read(str(path))
+    return [n for n in grid.cell_data.keys() if grid.cell_data[n].ndim == 1]
 
 
 def resolve_variable(query: str, names: list[str], prefer_time_avg: bool) -> str:
     qn = VAR_ALIASES.get(query.lower().strip(), norm_name(query))
     normed = {n: norm_name(n) for n in names}
-    want_avg = "time-avg" in qn
+    want_avg = "time avg" in qn  # norm_name turns 'Time-Avg' into 'time avg'
 
     def match(pool):
         exact = [n for n in pool if normed[n] == qn]
@@ -403,12 +564,12 @@ def resolve_variable(query: str, names: list[str], prefer_time_avg: bool) -> str
         sub = [n for n in pool if qn in normed[n]]
         return sub[0] if sub else None
 
-    base_pool = names if want_avg else [n for n in names if "time-avg" not in normed[n]]
+    base_pool = names if want_avg else [n for n in names if "time avg" not in normed[n]]
     hit = match(base_pool) or match(names)
     if hit is None:
         fail(f"variable '{query}' not found. Available: {names}")
     if prefer_time_avg and not want_avg:
-        avg = [n for n in names if normed[n] == f"time-avg {normed[hit]}"]
+        avg = [n for n in names if normed[n] == f"time avg {normed[hit]}"]
         if avg:
             hit = avg[0]
     return hit
@@ -416,13 +577,16 @@ def resolve_variable(query: str, names: list[str], prefer_time_avg: bool) -> str
 
 @dataclass
 class Field3D:
-    grid: "object"                 # pyvista ImageData
+    grid: "object"                 # pyvista ImageData (geometry only)
     nc: tuple[int, int, int]       # cells (nx, ny, nz)
     origin: np.ndarray
     spacing: np.ndarray
     var_name: str
     var: np.ndarray                # [z, y, x]
     velmag: np.ndarray | None      # [z, y, x]
+    covered: np.ndarray | None = None  # [z, y, x] cells present in a block file; None = all
+    solid: np.ndarray | None = None    # [z, y, x] cells inside the moving body
+    body: str = ""                     # where `solid` comes from, for the log
 
     def cell_centers_1d(self):
         o, sp, nc = self.origin, self.spacing, self.nc
@@ -433,67 +597,309 @@ class Field3D:
         Z, Y, X = np.meshgrid(zc, yc, xc, indexing="ij")
         return X, Y, Z
 
+    def coordinate(self, i: int, mask: np.ndarray) -> np.ndarray:
+        """Coordinate i (0 = x, 1 = y, 2 = z) of the cell centres selected by mask."""
+        shape = [1, 1, 1]
+        shape[2 - i] = -1
+        return np.broadcast_to(self.cell_centers_1d()[i].reshape(shape), mask.shape)[mask]
 
-def load_field(path: Path, var_query: str, prefer_time_avg: bool) -> Field3D:
+
+def read_frame(path: Path, names: list[str]) -> tuple:
+    """Selected cell arrays of one frame as float32 [z, y, x]: (nc, origin, spacing,
+    {name: array}, covered). Multi-GPU output (block0, block1, ...) is assembled into one
+    grid by each block's origin and extent; cells no block holds stay 0 and are flagged
+    in `covered` (None when every cell is covered)."""
     import pyvista as pv
 
-    grid = pv.read(str(path))
-    names = list(grid.cell_data.keys())
-    scalar_names = [n for n in names if grid.cell_data[n].ndim == 1]
-    var_name = resolve_variable(var_query, scalar_names, prefer_time_avg)
-    log(f"analysis variable: '{var_name}'")
-
-    nc = tuple(int(d) - 1 for d in grid.dimensions)
+    parts = []
+    for f in block_files(path):
+        reader = pv.get_reader(str(f))
+        reader.disable_all_cell_arrays()
+        reader.disable_all_point_arrays()
+        for n in names:
+            reader.enable_cell_array(n)
+        g = reader.read()
+        absent = [n for n in names if n not in g.cell_data]
+        if absent:
+            fail(f"{f.parent.name}/{f.name} has no cell array {absent}")
+        nc = tuple(int(d) - 1 for d in g.dimensions)
+        sp = np.array(g.spacing)
+        lo = np.array(g.origin) + np.array(g.extent[::2]) * sp
+        parts.append((nc, lo, sp, [np.asarray(g.cell_data[n], dtype=np.float32)
+                                   .reshape((nc[2], nc[1], nc[0])) for n in names]))
+    nc, lo, sp, arrays = parts[0]
+    if len(parts) == 1:
+        return nc, lo, sp, dict(zip(names, arrays)), None
+    if any(not np.allclose(p[2], sp, rtol=1e-6, atol=0) for p in parts):
+        fail(f"the blocks of {path.name} differ in grid spacing")
+    lo = np.min([p[1] for p in parts], axis=0)
+    offs = [np.rint((p[1] - lo) / sp).astype(int) for p in parts]
+    nc = tuple(int(max(o[a] + p[0][a] for o, p in zip(offs, parts))) for a in range(3))
     shape = (nc[2], nc[1], nc[0])
-    var = np.asarray(grid.cell_data[var_name], dtype=np.float32).reshape(shape)
+    out = {n: np.zeros(shape, np.float32) for n in names}
+    covered = np.zeros(shape, bool)
+    for (bnc, _, _, arrays), o in zip(parts, offs):
+        sl = tuple(slice(int(o[a]), int(o[a]) + bnc[a]) for a in (2, 1, 0))
+        covered[sl] = True
+        for n, a in zip(names, arrays):
+            out[n][sl] = a
+    return nc, lo, sp, out, None if covered.all() else covered
 
-    velmag = None
-    vm = [n for n in scalar_names if norm_name(n) == "velocity magnitude"]
-    if vm:
-        velmag = np.asarray(grid.cell_data[vm[0]], dtype=np.float32).reshape(shape)
 
-    return Field3D(grid=grid, nc=nc, origin=np.array(grid.origin),
-                   spacing=np.array(grid.spacing), var_name=var_name,
-                   var=var, velmag=velmag)
+class MovingBody:
+    """The cells inside the impeller. Moving-body cells carry the solid's velocity, so the
+    zero-velocity blanking misses them. They are taken from M-Star's posed mesh of the
+    frame (out/Output/VolumeMovingBody_<name>/block*/*.<time>.vtp) when the case has
+    it, else from the STL in its initial pose, placed as in input.xml."""
+
+    def __init__(self, case: Case, model: ModelInfo):
+        self.model = model
+        self.dirs: list[Path] = []
+        self.series: list[tuple[float, str]] = []
+        self.static: np.ndarray | None = None  # mask of the STL in its initial pose
+        self.stl = load_impeller(model) if model.impeller_stl is not None else None
+        self.name = model.impeller_stl.name if model.impeller_stl is not None else ""
+        if model.impeller_name and case.root.is_dir():
+            d = case.root / "out" / "Output" / f"VolumeMovingBody_{model.impeller_name}"
+            if d.is_dir():
+                self.dirs = block_dirs(d) or [d]
+                found = ((TIME_RE.search(f.stem), f.name) for f in self.dirs[0].glob("*.vtp"))
+                self.series = sorted((float(m.group(1)), name) for m, name in found if m)
+                self.name = d.name
+        self.posed = bool(self.series)
+
+    def _posed_surface(self, t: float):
+        import pyvista as pv
+
+        dt, t_mesh, name = min((abs(tm - t), tm, name) for tm, name in self.series)
+        if dt > 1e-5 * abs(t) + 1e-9:
+            warn(f"no posed moving-body mesh at t = {t:.6g} s; using the nearest one "
+                 f"(t = {t_mesh:.6g} s)")
+        parts = [pv.read(str(d / name)) for d in self.dirs if (d / name).is_file()]
+        parts = [p for p in parts if p.n_cells]
+        if not parts:
+            raise ValueError(f"{name} holds no surface")
+        surf = parts[0] if len(parts) == 1 else parts[0].append_polydata(*parts[1:])
+        return surf if surf.is_all_triangles else surf.triangulate()
+
+    def _turned_stl(self, posed: np.ndarray):
+        """The STL turned about the impeller axis into the pose of a posed mesh, or None
+        when no such rotation puts every STL vertex on a vertex of that mesh. The posed
+        mesh is M-Star's refinement of the same surface with ~50x the triangles, so the
+        STL gives the same cells in a fraction of the time."""
+        from scipy.spatial import cKDTree
+
+        axis, pivot = self.model.impeller_axis, self.model.impeller_pivot
+        if self.stl is None or axis is None or pivot is None:
+            return None
+        e1 = np.cross(axis, np.eye(3)[int(np.argmin(np.abs(axis)))])
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(axis, e1)
+
+        def cylindrical(points):
+            p = points - pivot
+            u, v = p @ e1, p @ e2
+            return p, p @ axis, np.hypot(u, v), np.arctan2(v, u)
+
+        s, s_ax, s_rad, s_phi = cylindrical(np.asarray(self.stl.points, dtype=np.float64))
+        _, p_ax, p_rad, p_phi = cylindrical(posed)
+        tol = 1e-5 * float(np.linalg.norm(s.max(axis=0) - s.min(axis=0)))
+        k = int(np.argmax(s_rad))  # the outermost STL vertex: where is it in the posed mesh?
+        tree = cKDTree(posed)
+        for j in np.flatnonzero((np.abs(p_rad - s_rad[k]) < tol) & (np.abs(p_ax - s_ax[k]) < tol))[:32]:
+            c, sn = np.cos(p_phi[j] - s_phi[k]), np.sin(p_phi[j] - s_phi[k])
+            turned = s * c + np.cross(axis, s) * sn + np.outer(s @ axis, axis) * (1 - c) + pivot
+            if tree.query(turned)[0].max() < tol:
+                mesh = self.stl.copy()
+                mesh.points = turned
+                return mesh
+        return None
+
+    def mask(self, fld: Field3D, t: float) -> np.ndarray | None:
+        """Cells inside the body at time t (the STL mask when there is no posed mesh)."""
+        if self.static is None and self.stl is not None:
+            self.static = stl_inside_mask(fld, self.stl)
+        if not self.posed:
+            return self.static
+        try:
+            surf = self._posed_surface(t)
+            turned = self._turned_stl(np.asarray(surf.points, dtype=np.float64))
+            inside = stl_inside_mask(fld, turned if turned is not None else surf)
+            n, n_stl = np.count_nonzero(inside), np.count_nonzero(self.static)
+            if self.static is not None and abs(n - n_stl) > 0.2 * n_stl:
+                raise ValueError(f"{n:,} cells inside it, {n_stl:,} inside the STL")
+            return inside
+        except Exception as e:
+            warn(f"posed moving-body mesh not usable ({e}); using '{self.model.impeller_stl.name}' "
+                 f"in its initial pose" if self.model.impeller_stl is not None else
+                 f"posed moving-body mesh not usable ({e}); moving body not excluded")
+            self.posed = False
+            self.name = self.model.impeller_stl.name if self.model.impeller_stl is not None else ""
+            return self.static
+
+
+def load_field(frames: list[tuple[float, Path]], var_name: str, vm_name: str | None,
+               body: MovingBody | None = None, shared: dict | None = None) -> Field3D:
+    """The field of one frame as it is, or the time average over several frames.
+
+    Averaging keeps running sums, so only one frame is in memory at a time. A cell is
+    fluid in a frame when its velocity magnitude is > 0 and, with a posed moving-body
+    mesh, it is not inside the body at that time. It is fluid when that holds in at
+    least half of the frames; its value is the mean over the frames in which it was
+    fluid. The mean velocity magnitude is set to 0 in the other cells, so 'velocity
+    magnitude > 0' stays the fluid test.
+
+    `shared` is kept between the variables of one run for the same frames: it holds
+    the velocity magnitude, the body cells and the per-frame fluid flags of the first
+    variable, so the next one reads only its own array.
+    """
+    import pyvista as pv
+
+    reuse = bool(shared) and "velmag" in shared
+    names = [var_name] if reuse else list(dict.fromkeys(n for n in (var_name, vm_name) if n))
+    n_frames = len(frames)
+    fld = None
+    flags, solid, solid_count, posed = [], None, None, False
+    for k, (t, path) in enumerate(frames):
+        nc, origin, spacing, arrays, covered = read_frame(path, names)
+        var = arrays[var_name]
+        if fld is None:
+            fld = Field3D(grid=None, nc=nc, origin=origin, spacing=spacing, var_name=var_name,
+                          var=var, velmag=None, covered=covered)
+            if n_frames > 1:
+                sum_var = np.zeros(var.shape, np.float64)
+                sum_vm = np.zeros(var.shape, np.float64) if vm_name and not reuse else None
+                count = np.zeros(var.shape, np.int32)
+        elif nc != fld.nc:
+            fail(f"grid size changes between frames ({fld.nc} vs {nc} cells in {path.name})")
+        if reuse:
+            if n_frames == 1:
+                break
+            is_fluid = np.unpackbits(shared["flags"][k], count=var.size).reshape(var.shape).view(bool)
+        else:
+            velmag = arrays.get(vm_name)
+            if body is not None and (body.posed or n_frames == 1):
+                solid = body.mask(fld, t)
+                if posed and not body.posed:
+                    fail(f"no usable posed moving-body mesh for {path.name}")
+                posed = body.posed
+            if n_frames == 1:
+                break
+            is_fluid = velmag > 0.0 if velmag is not None else np.isfinite(var)
+            if posed and solid is not None:
+                is_fluid &= ~solid
+                if solid_count is None:
+                    solid_count = np.zeros(var.shape, np.int32)
+                solid_count += solid
+            if velmag is not None:
+                np.add(sum_vm, velmag, out=sum_vm, where=is_fluid)
+            if shared is not None:
+                flags.append(np.packbits(is_fluid))
+        np.add(sum_var, var, out=sum_var, where=is_fluid)
+        count += is_fluid
+    if n_frames > 1:
+        seen = np.maximum(count, 1)
+        var = (sum_var / seen).astype(np.float32)
+        if not reuse:
+            if velmag is not None:
+                velmag = np.where(2 * count >= n_frames, sum_vm / seen, 0.0).astype(np.float32)
+            if solid_count is not None:  # posed meshes: inside the body in half of the frames
+                solid = 2 * solid_count >= n_frames
+            elif body is not None:
+                solid = body.mask(fld, frames[-1][0])
+        del sum_var, sum_vm, seen, count
+    if reuse:
+        velmag, solid, fld.body = shared["velmag"], shared["solid"], shared["body"]
+    else:
+        if body is not None and solid is not None:
+            fld.body = ((f"posed mesh {body.name} of " + ("the frame" if n_frames == 1 else
+                                                           f"each of the {n_frames} frames"))
+                        if body.posed else f"'{body.name}' in its initial pose")
+        if shared is not None and velmag is not None:  # the flags do not depend on the variable
+            shared.update(velmag=velmag, solid=solid, body=fld.body, flags=flags)
+
+    fld.grid = pv.ImageData(dimensions=tuple(n + 1 for n in nc), origin=tuple(origin),
+                            spacing=tuple(spacing))
+    fld.var, fld.velmag, fld.solid = var, velmag, solid
+    return fld
 
 
 # ---------------------------------------------------------------- masks
 
-def stl_inside_mask(fld: Field3D, stl: Path) -> np.ndarray:
-    """Cells whose centers lie inside the STL surface (enclosed-points test)."""
+def stl_inside_mask(fld: Field3D, stl) -> np.ndarray:
+    """Cells whose centers lie inside a closed surface (an STL file or a PolyData)."""
     import pyvista as pv
 
+    shape = (fld.nc[2], fld.nc[1], fld.nc[0])
+    surf = pv.read(str(stl)) if isinstance(stl, (str, Path)) else stl
+    try:  # rasterise the closed surface onto the cell-centre grid: seconds instead of minutes
+        from vtkmodules.util.numpy_support import vtk_to_numpy
+        from vtkmodules.vtkImagingStencil import vtkImageStencilToImage, vtkPolyDataToImageStencil
+
+        stencil = vtkPolyDataToImageStencil()
+        stencil.SetInputData(surf)
+        stencil.SetOutputOrigin(*(fld.origin + 0.5 * fld.spacing))
+        stencil.SetOutputSpacing(*fld.spacing)
+        stencil.SetOutputWholeExtent(0, fld.nc[0] - 1, 0, fld.nc[1] - 1, 0, fld.nc[2] - 1)
+        image = vtkImageStencilToImage()
+        image.SetInputConnection(stencil.GetOutputPort())
+        image.SetInsideValue(1)
+        image.SetOutsideValue(0)
+        image.SetOutputScalarTypeToUnsignedChar()
+        image.Update()
+        inside = vtk_to_numpy(image.GetOutput().GetPointData().GetScalars())
+        return inside.reshape(shape).astype(bool)
+    except Exception as e:
+        warn(f"image-stencil inside test failed ({e}); using the enclosed-points test")
     X, Y, Z = fld.cell_centers_3d()
     pts = pv.PolyData(np.column_stack([X.ravel(), Y.ravel(), Z.ravel()]))
-    surf = pv.read(str(stl))
     try:  # pyvista >= 0.46; select_enclosed_points is deprecated
         sel = pts.select_interior_points(surf, check_surface=False)
         inside = np.asarray(sel["selected_points"])
     except AttributeError:
         sel = pts.select_enclosed_points(surf, check_surface=False)
         inside = sel["SelectedPoints"].astype(bool)
-    return inside.reshape(fld.var.shape)
+    return inside.reshape(shape)
 
 
-def build_fluid_mask(fld: Field3D, fluid_stl: Path | None,
-                     moving_stl: Path | None = None) -> np.ndarray:
+def build_fluid_mask(fld: Field3D, fluid_stl: Path | None, shared: dict | None = None) -> np.ndarray:
+    """Fluid cells: finite value, non-zero velocity magnitude, not inside the moving body
+    (fld.solid). `shared` keeps the mask for the next variable of the same frames."""
+    finite = np.isfinite(fld.var)
+    if shared and "fluid" in shared:
+        log("fluid mask: reused from the previous variable (same frames)")
+        return shared["fluid"] if finite.all() else shared["fluid"] & finite
     # solid/exterior cells in M-Star volume output carry exact zeros
-    valid = np.isfinite(fld.var)
-    if fld.velmag is not None:
+    valid = finite.copy()
+    if fld.covered is not None:
+        valid &= fld.covered
+    by_velocity = fld.velmag is not None and bool((fld.velmag > 0.0).any())
+    if by_velocity:
         valid &= fld.velmag > 0.0
         log(f"solid/exterior blanking via zero velocity magnitude: "
             f"{np.count_nonzero(~valid):,} of {valid.size:,} cells excluded")
-    if moving_stl is not None:
+    if fld.solid is not None:
         # moving-body cells carry the solid's velocity, so zero-blanking misses them
-        solid = stl_inside_mask(fld, moving_stl)
-        valid &= ~solid
-        log(f"moving body '{moving_stl.name}' excluded: "
-            f"{np.count_nonzero(solid):,} cells")
-    if fluid_stl is None:
-        return valid
+        valid &= ~fld.solid
+        log(f"moving body excluded ({fld.body}): {np.count_nonzero(fld.solid):,} cells")
+    if by_velocity:
+        # the fill STL is only the initial region of one fluid: it is not used here
+        log("fluid mask: non-zero velocity magnitude"
+            + (f" (initial-fill '{fluid_stl.name}' not used)" if fluid_stl is not None else ""))
+        log(f"fluid cells: {np.count_nonzero(valid):,} "
+            f"({100 * np.count_nonzero(valid) / valid.size:.1f}% of domain)")
+    elif fluid_stl is not None:
+        valid = _fill_stl_mask(fld, fluid_stl, valid)
+    if shared is not None and finite.all():  # else the mask depends on this variable
+        shared["fluid"] = valid
+    return valid
 
+
+def _fill_stl_mask(fld: Field3D, fluid_stl: Path, valid: np.ndarray) -> np.ndarray:
+    """Fallback without a usable velocity array: crop to the initial-fill STL."""
     import pyvista as pv
 
+    warn("no usable velocity magnitude array: fluid mask falls back to the initial-fill STL")
     mesh = pv.read(str(fluid_stl))
     b = np.array(mesh.bounds).reshape(3, 2)
     boxy = False
@@ -502,11 +908,11 @@ def build_fluid_mask(fld: Field3D, fluid_stl: Path | None,
         boxy = bounds_vol > 0 and abs(mesh.volume - bounds_vol) / bounds_vol < 0.05
     except Exception:
         pass
-    X, Y, Z = fld.cell_centers_3d()
     if boxy:
-        inside = ((X >= b[0, 0]) & (X <= b[0, 1]) &
-                  (Y >= b[1, 0]) & (Y <= b[1, 1]) &
-                  (Z >= b[2, 0]) & (Z <= b[2, 1]))
+        xc, yc, zc = fld.cell_centers_1d()
+        inside = (((xc >= b[0, 0]) & (xc <= b[0, 1]))[None, None, :] &
+                  ((yc >= b[1, 0]) & (yc <= b[1, 1]))[None, :, None] &
+                  ((zc >= b[2, 0]) & (zc <= b[2, 1]))[:, None, None])
         log(f"fluid mask from '{fluid_stl.name}' (axis-aligned box bounds)")
     else:
         inside = stl_inside_mask(fld, fluid_stl)
@@ -519,23 +925,32 @@ def build_fluid_mask(fld: Field3D, fluid_stl: Path | None,
 
 def cylinder_mask(fld: Field3D, center: np.ndarray, axis: np.ndarray,
                   radius: float, span: tuple[float, float]) -> np.ndarray:
-    X, Y, Z = fld.cell_centers_3d()
-    dx, dy, dz = X - center[0], Y - center[1], Z - center[2]
-    axial = dx * axis[0] + dy * axis[1] + dz * axis[2]
-    rad2 = ((dx - axial * axis[0]) ** 2 + (dy - axial * axis[1]) ** 2 +
-            (dz - axial * axis[2]) ** 2)
+    xc, yc, zc = fld.cell_centers_1d()
+    d = (xc[None, None, :] - center[0], yc[None, :, None] - center[1], zc[:, None, None] - center[2])
+    k = int(np.argmax(np.abs(axis)))
+    if abs(axis[k]) == 1.0 and np.count_nonzero(axis) == 1:
+        # shaft along a grid direction: the same sums, without 3-D temporaries
+        i, j = (m for m in range(3) if m != k)
+        axial = d[k] * axis[k]
+        rad2 = d[i] ** 2 + d[j] ** 2
+    else:
+        axial = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2]
+        rad2 = ((d[0] - axial * axis[0]) ** 2 + (d[1] - axial * axis[1]) ** 2 +
+                (d[2] - axial * axis[2]) ** 2)
     return (rad2 <= radius ** 2) & (axial >= span[0]) & (axial <= span[1])
 
 
 def detect_impeller_zone(fld: Field3D, fluid: np.ndarray, model: ModelInfo,
                          pad: float, percentile: float, shape: str) -> np.ndarray:
-    import pyvista as pv
     from scipy import ndimage
 
     if model.impeller_stl is not None and model.impeller_axis is not None:
-        mesh = pv.read(str(model.impeller_stl))
-        axis = np.abs(model.impeller_axis)
+        mesh = load_impeller(model)
+        axis = model.impeller_axis
         center = np.array(mesh.center)
+        if model.impeller_pivot is not None:
+            # on the rotation axis (the line through the pivot), level with the STL centre
+            center = model.impeller_pivot + ((center - model.impeller_pivot) @ axis) * axis
         pts = mesh.points - center
         axial = pts @ axis
         radial = np.linalg.norm(pts - np.outer(axial, axis), axis=1)
@@ -567,10 +982,10 @@ def detect_impeller_zone(fld: Field3D, fluid: np.ndarray, model: ModelInfo,
         mask = ndimage.binary_dilation(core, structure=struct, iterations=2) & fluid
         log(f"impeller zone: dilated velocity-maxima blob, {np.count_nonzero(mask):,} cells")
         return mask
-    X, Y, Z = fld.cell_centers_3d()
+    X, Y, Z = (fld.coordinate(i, core) for i in range(3))  # centres of the core cells
     axis = np.array([0.0, 1.0, 0.0])  # default tank axis when nothing else is known
-    center = np.array([X[core].mean(), Y[core].mean(), Z[core].mean()])
-    dxyz = np.stack([X[core] - center[0], Y[core] - center[1], Z[core] - center[2]])
+    center = np.array([X.mean(), Y.mean(), Z.mean()])
+    dxyz = np.stack([X - center[0], Y - center[1], Z - center[2]])
     axial = axis @ dxyz
     radial = np.linalg.norm(dxyz - np.outer(axis, axial), axis=0)
     radius = radial.max() * (1 + pad)
@@ -645,7 +1060,7 @@ def bin_values(vals: np.ndarray, log_base: float) -> tuple[np.ndarray, np.ndarra
     uniq = np.unique(e)[::-1]  # occupied bins only, highest first
     labels = np.searchsorted(-uniq, -e).astype(np.int32)
     centers = log_base ** (uniq + 0.5)
-    bounds = log_base ** uniq[:-1].astype(np.float64)  # lower edge of each upper bin
+    bounds = log_base ** (uniq[1:] + 1.0)  # upper edge of each bin below the top one
     log(f"log-bin zoning (base {log_base:g}): {len(uniq)} occupied bins spanning "
         f"{log_base ** uniq[-1]:.3g} .. {log_base ** (uniq[0] + 1):.3g}")
     return labels, centers, bounds
@@ -674,7 +1089,8 @@ def spatialize(zone_class: np.ndarray, fluid: np.ndarray, min_frac: float) -> np
             comp_mask = lab[sle] == comp
             ring = ndimage.binary_dilation(comp_mask, structure=struct) & ~comp_mask
             neigh = zone_class[sle][ring]
-            neigh = neigh[(neigh > 0) & (neigh != c)]
+            # merge into another value class, never into the geometric impeller zone
+            neigh = neigh[(neigh >= first_mergeable) & (neigh != c)]
             if neigh.size:
                 zone_class[sle][comp_mask] = np.bincount(neigh).argmax()
                 merged += 1
@@ -699,35 +1115,50 @@ def spatialize(zone_class: np.ndarray, fluid: np.ndarray, min_frac: float) -> np
 
 # ---------------------------------------------------------------- reporting
 
-def zone_summary(mask: np.ndarray, var: np.ndarray, cell_vol: float, n_fluid: int) -> dict:
-    v = var[mask]
-    return {
-        "cells": int(mask.sum()),
-        "volume_m3": mask.sum() * cell_vol,
-        "vol_frac": mask.sum() / n_fluid,
-        "mean": float(v.mean()) if v.size else np.nan,
-        "std": float(v.std()) if v.size else np.nan,
-        "min": float(v.min()) if v.size else np.nan,
-        "max": float(v.max()) if v.size else np.nan,
-    }
+def _stable_order(labels: np.ndarray) -> np.ndarray:
+    """argsort(labels, kind='stable') in linear time (numpy radix-sorts 16-bit keys)."""
+    order = np.argsort(labels.astype(np.uint16), kind="stable")  # low 16 bits
+    if labels.max() > 0xFFFF:
+        order = order[np.argsort((labels[order] >> 16).astype(np.uint16), kind="stable")]
+    return order
 
 
 def collect_zone_rows(zone_class: np.ndarray, zone_id: np.ndarray, fluid: np.ndarray,
                       var: np.ndarray, cell_vol: float) -> list[tuple[str, int, str, dict]]:
     """Per-class and per-subzone stats rows: (level, id, label, summary)."""
     n_fluid = int(np.count_nonzero(fluid))
+    labelled = zone_class > 0
+    cls, ids, vals = zone_class[labelled], zone_id[labelled], var[labelled]  # grid order
+
+    def summary(v: np.ndarray) -> dict:
+        n = np.int64(v.size)
+        return {
+            "cells": int(n),
+            "volume_m3": n * cell_vol,
+            "vol_frac": n / n_fluid,
+            "mean": float(v.mean()) if v.size else np.nan,
+            "std": float(v.std()) if v.size else np.nan,
+            "min": float(v.min()) if v.size else np.nan,
+            "max": float(v.max()) if v.size else np.nan,
+        }
+
     rows = []
-    for c in np.unique(zone_class):
-        if c < 1:
-            continue
-        name = zone_label(int(c))
-        rows.append(("class", int(c), name, zone_summary(zone_class == c, var, cell_vol, n_fluid)))
-    for z in np.unique(zone_id):
-        if z < 1:
-            continue
-        c = int(zone_class[zone_id == z][0])
-        name = zone_label(c)
-        rows.append(("subzone", int(z), name, zone_summary(zone_id == z, var, cell_vol, n_fluid)))
+    for level, labels in (("class", cls), ("subzone", ids)):
+        counts = np.bincount(labels) if labels.size else np.zeros(1, np.int64)
+        present = np.flatnonzero(counts)
+        present = present[present >= 1]
+        if present.size > 8:  # many groups: sort once, each group keeps its grid order
+            order = _stable_order(labels)
+            v_sorted, c_sorted = vals[order], cls[order]
+            ends = np.cumsum(counts)
+        for z in present:
+            if present.size > 8:
+                a, b = ends[z] - counts[z], ends[z]
+                v, c = v_sorted[a:b], int(c_sorted[a])
+            else:
+                mask = labels == z
+                v, c = vals[mask], int(cls[np.argmax(mask)])
+            rows.append((level, int(z), zone_label(c), summary(v)))
     return rows
 
 
@@ -747,7 +1178,8 @@ def heterogeneity_stats(fld: Field3D, fluid: np.ndarray, zone_class: np.ndarray,
     cv = sd / mu if mu else np.nan
     pos = v[v > 0]
     sigma_log10 = float(np.log10(pos).std()) if pos.size else np.nan
-    pct = {f"p{q:02d}": float(np.percentile(v, q)) for q in (5, 25, 50, 75, 95, 99)}
+    qs = (5, 25, 50, 75, 95, 99)
+    pct = {f"p{q:02d}": float(p) for q, p in zip(qs, np.percentile(v, qs))}
 
     # variance decomposition: fraction of total variance explained by the zones
     ss_total = sd ** 2 * v.size
@@ -804,8 +1236,8 @@ def report_heterogeneity(het: dict, var_name: str, out_csv: Path,
         rsd = (f"   RSD = {het['mstar_rsd_percent']:.3f}%" if "mstar_rsd_percent" in het else "")
         print(f"  M-Star scalar stats: global mean = {het['mstar_global_mean']:.6g}{rsd} "
               f"at t = {het['mstar_stats_time_s']:.3g} s")
-        print(f"  => local-vs-global gradients {verdict} "
-            f"(criteria: eta^2 >= {eta2_thr} and zone contrast >= {contrast_thr})")
+    print(f"  => local-vs-global gradients {verdict} "
+          f"(criteria: eta^2 >= {eta2_thr} and zone contrast >= {contrast_thr})")
 
 
 @dataclass
@@ -858,10 +1290,211 @@ def write_labeled_vti(fld: Field3D, zone_class: np.ndarray, zone_id: np.ndarray,
 
 # ---------------------------------------------------------------- plots & render
 
+def view_center(model: ModelInfo, centers: tuple, zone_class: np.ndarray) -> np.ndarray:
+    """The point the side views are cut through: on the impeller axis (the pivot of
+    input.xml, else the centre of the STL), or the centroid of the labelled cells when
+    there is no impeller. centers = cell centres along (x, y, z)."""
+    if model.impeller_pivot is not None:
+        return model.impeller_pivot
+    if model.impeller_stl is not None:
+        return np.array(load_impeller(model).center)
+    lab = zone_class > 0
+    along = (lab.sum(axis=(0, 1)), lab.sum(axis=(0, 2)), lab.sum(axis=(1, 2)))  # x, y, z
+    return np.array([float((cc * n).sum() / max(n.sum(), 1)) for cc, n in zip(centers, along)])
+
+
+def zone_views(fld: Field3D, zone_class: np.ndarray, axis: np.ndarray | None,
+               center: np.ndarray | None = None) -> list[tuple]:
+    """ZoneClass cross-sections: two side views through `center` (a point on the tank
+    axis, see view_center; coordinate 0 when not given; not the grid mid-index: the
+    domain need not be centered) and a top view normal to the shaft through the
+    impeller-zone centre.
+    [(name, img[v, u], (u_centres, v_centres), u_label, v_label, description, plane_coord)]"""
+    xc, yc, zc = fld.cell_centers_1d()
+    u = np.abs(axis) if axis is not None else np.array([0.0, 1.0, 0.0])  # dominant axis only
+    c = np.zeros(3) if center is None else center
+    kx, ky, kz = (int(np.argmin(np.abs(cc - c[i]))) for i, cc in enumerate((xc, yc, zc)))
+    if u[2] < 0.9:  # slice normal to z, plus perpendicular side view normal to x
+        views = [
+            ("side", zone_class[kz, :, :], (xc, yc), "x [m]", "y [m]",
+             "side view, facing +Z", float(zc[kz])),
+            ("side2", zone_class[:, :, kx].T, (zc, yc), "z [m]", "y [m]",
+             "side view, facing +X", float(xc[kx])),
+        ]
+    else:  # z-axis tank: slice normal to y, plus perpendicular side view normal to x
+        views = [
+            ("side", zone_class[:, ky, :], (xc, zc), "x [m]", "z [m]",
+             "side view, facing +Y", float(yc[ky])),
+            ("side2", zone_class[:, :, kx], (yc, zc), "y [m]", "z [m]",
+             "side view, facing +X", float(xc[kx])),
+        ]
+    ax_xyz = int(np.argmax(u))
+    np_ax = 2 - ax_xyz  # zone_class axes are [z, y, x]
+    imp_idx = np.nonzero(zone_class == 1)[np_ax]
+    k = int(round(imp_idx.mean())) if imp_idx.size else zone_class.shape[np_ax] // 2
+    if ax_xyz == 1:
+        views.append(("top", zone_class[:, k, :], (xc, zc), "x [m]", "z [m]",
+                      f"top view, y = {yc[k]:.4f} m", float(yc[k])))
+    elif ax_xyz == 2:
+        views.append(("top", zone_class[k, :, :], (xc, yc), "x [m]", "y [m]",
+                      f"top view, z = {zc[k]:.4f} m", float(zc[k])))
+    else:
+        views.append(("top", zone_class[:, :, k], (yc, zc), "y [m]", "z [m]",
+                      f"top view, x = {xc[k]:.4f} m", float(xc[k])))
+    return views
+
+
+def write_zone_slices(out_dir: Path, fld: Field3D, zone_class: np.ndarray,
+                      axis: np.ndarray | None, center: np.ndarray | None = None,
+                      max_cells: int = 400) -> None:
+    """The zone maps as data: zone_slices.csv (one row per view with its grid) and
+    zone_slice_<view>.csv (ZoneClass matrix, rows = v, columns = u, first column = v
+    coordinate, header = u coordinates; 0 = solid/outside), strided to <= max_cells
+    per axis so a viewer can draw many cases at once."""
+    meta = []
+    for name, img, (uc, vc), ul, vl, desc, coord in zone_views(fld, zone_class, axis, center):
+        s = max(1, -(-max(img.shape) // max_cells))
+        img, uc, vc = img[::s, ::s], uc[::s], vc[::s]
+        du = float(uc[1] - uc[0]) if len(uc) > 1 else s * float(fld.spacing["xyz".index(ul[0])])
+        dv = float(vc[1] - vc[0]) if len(vc) > 1 else s * float(fld.spacing["xyz".index(vl[0])])
+        with open(out_dir / f"zone_slice_{name}.csv", "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow([f"{vl[0]} \\ {ul[0]} [m]", *(f"{x:.6g}" for x in uc)])
+            for v, row in zip(vc, img):
+                w.writerow([f"{v:.6g}", *row.tolist()])
+        meta.append([name, desc, ul, vl, f"{uc[0]:.6g}", f"{du:.6g}", len(uc),
+                     f"{vc[0]:.6g}", f"{dv:.6g}", len(vc), f"{coord:.6g}",
+                     fld.var_name, var_unit(fld.var_name).strip()])
+    with open(out_dir / "zone_slices.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["view", "title", "u_label", "v_label", "u0 [m]", "du [m]", "nu [count]",
+                    "v0 [m]", "dv [m]", "nv [count]", "plane_coordinate [m]", "variable", "unit"])
+        w.writerows(meta)
+    log(f"wrote zone slices to {out_dir}")
+
+
+def write_zoner_summary(out_dir: Path, case_name: str, variable: str, fld: Field3D,
+                        het: dict, class_means: dict[int, float], t_sel: float,
+                        t_steady: float | None, t_avg: float | None = None,
+                        n_frames: int = 1) -> None:
+    """zoner_summary.csv: one row of scalar results (column 'case' first) so a viewer
+    can compare cases; column names carry the requested variable and units."""
+    unit = var_unit(fld.var_name).strip() or "1"
+    ratio = f"({unit})/({unit})"
+    a = variable.strip()
+    cols = {
+        "case": case_name,
+        f"variable ({a})": fld.var_name,
+        f"analysis time ({a}) [s]": t_sel,
+        f"steady start ({a}) [s]": "" if t_steady is None else t_steady,
+        f"averaging start ({a}) [s]": t_sel if t_avg is None else t_avg,
+        f"frames averaged ({a}) [count]": n_frames,
+        f"zones ({a}) [count]": len(class_means),
+        f"global mean ({a}) [{unit}]": het.get("global_mean"),
+        f"CV ({a}) [{ratio}]": het.get("cv"),
+        f"sigma log10 ({a}) [log10({unit})]": het.get("sigma_log10"),
+        f"p50 ({a}) [{unit}]": het.get("p50"),
+        f"p95 ({a}) [{unit}]": het.get("p95"),
+        f"p99 ({a}) [{unit}]": het.get("p99"),
+        f"p95/p50 ({a}) [{ratio}]": het.get("p95_over_p50"),
+        f"p99/mean ({a}) [{ratio}]": het.get("p99_over_mean"),
+        f"eta2 between zones ({a}) [{ratio}]": het.get("eta2_between_zone"),
+        f"zone contrast ({a}) [{ratio}]": het.get("zone_contrast"),
+        f"gradient index ({a}) [{ratio}]": het.get("grad_index"),
+        f"gradient index p95 ({a}) [{ratio}]": het.get("grad_index_p95"),
+        f"significant gradients ({a}) [bool]": int(bool(het.get("significant_gradients"))),
+    }
+    if "mstar_global_mean" in het:
+        cols[f"M-Star global mean ({a}) [{unit}]"] = het["mstar_global_mean"]
+    if "mstar_rsd_percent" in het:
+        cols[f"M-Star RSD ({a}) [%]"] = het["mstar_rsd_percent"]
+    with open(out_dir / "zoner_summary.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(cols.keys())
+        w.writerow(cols.values())
+    log(f"wrote {out_dir / 'zoner_summary.csv'}")
+
+def log_edges(pos: np.ndarray, n: int) -> np.ndarray:
+    """n log-spaced histogram edges that include the smallest and the largest value
+    (the rounded end points of logspace can miss them)."""
+    edges = np.logspace(np.log10(pos.min()), np.log10(pos.max()), n)
+    edges[0], edges[-1] = min(edges[0], pos.min()), max(edges[-1], pos.max())
+    return edges
+
+
+def write_data_csvs(out_dir: Path, fld: Field3D, fluid: np.ndarray, zone_class: np.ndarray,
+                    class_upper: dict[int, float | None], trace: tuple | None,
+                    t_steady: float | None, t_sel: float, axis: np.ndarray | None,
+                    class_means: dict[int, float] | None = None) -> None:
+    """The data behind the diagnostic plots as CSVs, so a viewer can draw them:
+    time_trace.csv, histogram.csv (log bins), class_boundaries.csv (upper boundary of
+    each value class), exposure_cdf.csv (volume fraction at or below a value),
+    zone_weights.csv and profiles.csv (axial / radial volume-averaged profiles)."""
+    unit = var_unit(fld.var_name)
+    if trace is not None:
+        times, values, label = trace
+        with open(out_dir / "time_trace.csv", "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["time [s]", label, "steady_start_s", "analysis_time_s"])
+            for i, (t, v) in enumerate(zip(times, values)):
+                w.writerow([t, v, t_steady if i == 0 else "", t_sel if i == 0 else ""])
+    vals = fld.var[fluid].astype(np.float64)
+    pos = vals[vals > 0]
+    if pos.size:
+        edges = log_edges(pos, 121)
+        counts, _ = np.histogram(pos, edges)
+        with open(out_dir / "histogram.csv", "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow([f"bin_low [{unit.strip()}]", f"bin_high [{unit.strip()}]", "cells [count]", "volume_fraction [m^3/m^3]"])
+            for lo, hi, n in zip(edges[:-1], edges[1:], counts):
+                w.writerow([lo, hi, int(n), n / vals.size])
+    sv = np.sort(vals)
+    idx = np.linspace(0, sv.size - 1, min(4000, sv.size)).astype(int)
+    with open(out_dir / "exposure_cdf.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow([fld.var_name, "cumulative_volume_fraction [m^3/m^3]"])
+        for i in idx:
+            w.writerow([sv[i], (i + 1) / sv.size])
+    with open(out_dir / "class_boundaries.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["class", "label", f"zone_mean [{unit.strip()}]", f"upper_boundary [{unit.strip()}]"])
+        for c in sorted(class_means or {}):  # blank: impeller zone and the top value class
+            upper = class_upper.get(c)
+            w.writerow([c, zone_label(c, class_means, unit), class_means[c],
+                        "" if upper is None else upper])
+    if class_means:
+        cls = sorted(class_means)
+        n_fluid = np.count_nonzero(fluid)
+        vfrac = np.array([np.count_nonzero(zone_class == c) / n_fluid for c in cls])
+        weight = vfrac * np.array([class_means[c] for c in cls])
+        weight /= weight.sum() if weight.sum() else 1.0
+        with open(out_dir / "zone_weights.csv", "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["class", "label", "volume_fraction [m^3/m^3]", f"contribution_to_mean [({unit.strip()})/({unit.strip()})]"])
+            for c, vf, wt in zip(cls, vfrac, weight):
+                w.writerow([c, zone_label(c, class_means, unit), vf, wt])
+    u = np.abs(axis) if axis is not None else np.array([0.0, 1.0, 0.0])  # dominant axis only
+    up_i = int(np.argmax(u))
+    a = fld.coordinate(up_i, fluid).astype(np.float64)
+    others = [fld.coordinate(i, fluid).astype(np.float64) for i in range(3) if i != up_i]
+    r = np.hypot(others[0] - others[0].mean(), others[1] - others[1].mean())
+    with open(out_dir / "profiles.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["profile", "coordinate [m]", f"{fld.var_name} (volume mean)", "cells [count]"])
+        for name, coord in ((f"axial ({'xyz'[up_i]})", a), ("radial", r)):
+            edges = np.linspace(coord.min(), coord.max(), 41)
+            sums, _ = np.histogram(coord, edges, weights=vals)
+            cnts, _ = np.histogram(coord, edges)
+            for mid, s, n in zip((edges[:-1] + edges[1:]) / 2, sums, cnts):
+                w.writerow([name, mid, s / n if n else "", int(n)])
+    log(f"wrote plot data CSVs to {out_dir}")
+
+
 def make_plots(out_dir: Path, fld: Field3D, fluid: np.ndarray, zone_class: np.ndarray,
-               bounds: np.ndarray, trace: tuple | None, t_steady: float | None,
-               t_sel: float, axis: np.ndarray | None,
-               class_means: dict[int, float] | None = None) -> None:
+               class_upper: dict[int, float | None], trace: tuple | None,
+               t_steady: float | None, t_sel: float, axis: np.ndarray | None,
+               class_means: dict[int, float] | None = None,
+               center: np.ndarray | None = None) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -887,10 +1520,9 @@ def make_plots(out_dir: Path, fld: Field3D, fluid: np.ndarray, zone_class: np.nd
     pos = vals[vals > 0]
     fig, ax = plt.subplots(figsize=(8, 4.5))
     if pos.size:
-        ax.hist(pos, bins=np.logspace(np.log10(pos.min()), np.log10(pos.max()), 120),
-                color="steelblue", alpha=0.8)
+        ax.hist(pos, bins=log_edges(pos, 120), color="steelblue", alpha=0.8)
         ax.set_xscale("log")
-    for i, b in enumerate(bounds):
+    for i, b in enumerate(b for b in class_upper.values() if b is not None):
         ax.axvline(b, color="k", ls="--", lw=1, label="class boundary" if i == 0 else None)
     if class_means:
         for c in sorted(class_means):
@@ -938,7 +1570,6 @@ def make_plots(out_dir: Path, fld: Field3D, fluid: np.ndarray, zone_class: np.nd
 
     # vertical cross-section containing the rotation axis
     u = np.abs(axis) if axis is not None else np.array([0.0, 1.0, 0.0])
-    xc, yc, zc = fld.cell_centers_1d()
     n_classes = int(zone_class.max())
     cmap = ListedColormap([colors.get(c, plt.cm.turbo(0.5)) for c in range(1, n_classes + 1)])
 
@@ -987,40 +1618,9 @@ def make_plots(out_dir: Path, fld: Field3D, fluid: np.ndarray, zone_class: np.nd
         fig.savefig(out_dir / fname, dpi=150)
         plt.close(fig)
 
-    # slice through the tank axis (coordinate 0), not the grid mid-index: the
-    # domain is not necessarily centered, so mid-index planes can cut off-axis
-    kx, ky, kz = (int(np.argmin(np.abs(cc))) for cc in (xc, yc, zc))
-    if u[2] < 0.9:  # slice normal to z, plus perpendicular side view normal to x
-        views = [
-            (zone_class[kz, :, :], [xc[0], xc[-1], yc[0], yc[-1]],
-             "x [m]", "y [m]", "side view, facing +Z", ""),
-            (zone_class[:, :, kx].T, [zc[0], zc[-1], yc[0], yc[-1]],
-             "z [m]", "y [m]", "side view, facing +X", "_side2"),
-        ]
-    else:  # z-axis tank: slice normal to y, plus perpendicular side view normal to x
-        views = [
-            (zone_class[:, ky, :], [xc[0], xc[-1], zc[0], zc[-1]],
-             "x [m]", "z [m]", "side view, facing +Y", ""),
-            (zone_class[:, :, kx], [yc[0], yc[-1], zc[0], zc[-1]],
-             "y [m]", "z [m]", "side view, facing +X", "_side2"),
-        ]
-
-    # top view: slice normal to the shaft axis through the impeller-zone centre
-    ax_xyz = int(np.argmax(u))
-    np_ax = 2 - ax_xyz  # zone_class axes are [z, y, x]
-    imp_idx = np.nonzero(zone_class == 1)[np_ax]
-    k = int(round(imp_idx.mean())) if imp_idx.size else zone_class.shape[np_ax] // 2
-    if ax_xyz == 1:
-        views.append((zone_class[:, k, :], [xc[0], xc[-1], zc[0], zc[-1]], "x [m]", "z [m]",
-                      f"top view, y = {yc[k]:.4f} m", "_top"))
-    elif ax_xyz == 2:
-        views.append((zone_class[k, :, :], [xc[0], xc[-1], yc[0], yc[-1]], "x [m]", "y [m]",
-                      f"top view, z = {zc[k]:.4f} m", "_top"))
-    else:
-        views.append((zone_class[:, :, k], [yc[0], yc[-1], zc[0], zc[-1]], "y [m]", "z [m]",
-                      f"top view, x = {xc[k]:.4f} m", "_top"))
-
-    for img, extent, xl, yl, desc, suf in views:
+    for name, img, (uc, vc), xl, yl, desc, _ in zone_views(fld, zone_class, axis, center):
+        extent = [uc[0], uc[-1], vc[0], vc[-1]]
+        suf = "" if name == "side" else f"_{name}"
         plot_slice(img, extent, xl, yl, f"Zone map ({desc})", f"zone_slice{suf}.png")
         if class_means:
             plot_pct_slice(img, extent, xl, yl,
@@ -1055,11 +1655,9 @@ def make_plots(out_dir: Path, fld: Field3D, fluid: np.ndarray, zone_class: np.nd
     write_interactive_html(pfig, out_dir / "exposure_cdf.html")
 
     # axial & radial profiles: where the gradients sit macroscopically
-    X, Y, Z = fld.cell_centers_3d()
     up_i = int(np.argmax(u))
-    coords = (X, Y, Z)
-    a = coords[up_i][fluid].astype(np.float64)
-    others = [coords[i][fluid].astype(np.float64) for i in range(3) if i != up_i]
+    a = fld.coordinate(up_i, fluid).astype(np.float64)
+    others = [fld.coordinate(i, fluid).astype(np.float64) for i in range(3) if i != up_i]
     r = np.hypot(others[0] - others[0].mean(), others[1] - others[1].mean())
     vv = fld.var[fluid].astype(np.float64)
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
@@ -1187,9 +1785,9 @@ def render_3d(out_dir: Path, fld: Field3D, zone_class: np.ndarray, model: ModelI
         except Exception:
             pass
     if model.impeller_stl is not None:
-        pl.add_mesh(pv.read(str(model.impeller_stl)), color="dimgray")
+        pl.add_mesh(load_impeller(model), color="dimgray")
     pl.add_legend(bcolor="white", size=(0.32, 0.18), loc="upper left")
-    up = tuple(np.abs(model.impeller_axis)) if model.impeller_axis is not None else (0, 1, 0)
+    up = tuple(up_axis(model.impeller_axis))
     pl.view_vector((1.0, 0.6, 1.0), viewup=up)
     pl.reset_camera(bounds=lab.bounds)  # keep focus on the tank, not far-reaching probe/shaft STLs
     pl.camera.zoom(0.85)
@@ -1212,37 +1810,79 @@ def render_3d(out_dir: Path, fld: Field3D, zone_class: np.ndarray, model: ModelI
 
 # ---------------------------------------------------------------- pipeline
 
-def run_case(case: Case, model: ModelInfo, variable: str, args, out_dir: Path) -> CaseResult:
-    """Full zoning/analysis pipeline for one case and one variable."""
+def run_case(case: Case, model: ModelInfo, variable: str, args, out_dir: Path,
+             shared: dict | None = None) -> CaseResult:
+    """Full zoning/analysis pipeline for one case and one variable. `shared` (one dict
+    per case) carries what does not depend on the variable to the next variable."""
     trace = steady_trace_from_stats(case, variable, args.steady_on)
     t_steady = None
+    no_plateau = False
     if args.time is not None:
         t_target = args.time
-        log(f"user-defined analysis time: {t_target} s")
+        log(f"user-defined start time: {t_target} s")
+    elif trace is None:
+        warn("no stats trace available; using last VTI timestep")
+        t_target = case.vti_series[-1][0]
     else:
-        if trace is None:
-            warn("no stats trace available; using last VTI timestep")
-            t_target = case.vti_series[-1][0]
+        t_steady = detect_steady_state(trace[0], trace[1], args.window, args.tol)
+        if t_steady is not None and trace[0][-1] - t_steady < 2 * args.window:
+            t_steady = None  # shorter than the two windows the test compares: not a plateau
+        if t_steady is None:  # fall back to the last 25 % of the trace's time span
+            no_plateau = True
+            t_target = float(f"{trace[0][-1] - 0.25 * (trace[0][-1] - trace[0][0]):.6g}")
         else:
-            t_steady = detect_steady_state(trace[0], trace[1], args.window, args.tol)
             t_target = t_steady
             log(f"steady state detected at t = {t_steady:.3f} s")
-    later = [(t, f) for t, f in case.vti_series if t >= t_target - 1e-9]
-    t_sel, vti_path = later[0] if later else case.vti_series[-1]
-    log(f"analysis timestep: t = {t_sel:.3g} s ({vti_path.name})")
+
+    # --- frames to analyse: one frame, the Time-Avg array of the last frame, or the
+    # average of the instantaneous field over every frame from t_target on
+    names = scalar_cell_arrays(case.vti_series[-1][1])
+    var_name = resolve_variable(variable, names, prefer_time_avg=not args.instantaneous)
+    vm = [n for n in names if norm_name(n) == "velocity magnitude"]
+    later = [(t, f) for t, f in case.vti_series if t >= t_target - 1e-9] or case.vti_series[-1:]
+    if args.instantaneous:
+        frames = later[-1:] if no_plateau else later[:1]
+    elif "time avg" in norm_name(var_name):
+        frames = case.vti_series[-1:]
+        if args.time is not None:
+            warn("--time does not select the frame of a Time-Avg array (last frame is used)")
+    else:
+        frames = later
+    if no_plateau:
+        warn(f"no steady plateau of at least two windows found (window={args.window}s, tol={args.tol}): "
+             + ("using the last frame" if frames is not later else
+                f"using the frames of the last 25 % of the trace (t >= {t_target:.3f} s)"))
+    t_avg, t_sel = frames[0][0], frames[-1][0]
+    if len(frames) > 1:
+        log(f"time-averaged over {len(frames)} frames, t = {t_avg:.3g} .. {t_sel:.3g} s")
+    else:
+        log(f"analysis timestep: t = {t_sel:.3g} s ({frames[0][1].name})"
+            + ("" if args.instantaneous or frames[0][1] != case.vti_series[-1][1] else ", last frame"))
+    log(f"analysis variable: '{var_name}'")
 
     # --- load field & masks
-    fld = load_field(vti_path, variable, prefer_time_avg=not args.instantaneous)
-    fluid = build_fluid_mask(fld, model.fluid_stl, model.impeller_stl)
+    same = None  # velocity magnitude, body cells and masks of these frames
+    if shared is not None:
+        same = shared.setdefault(tuple(f for _, f in frames), {})
+        body = shared.setdefault("body", MovingBody(case, model))
+    else:
+        body = MovingBody(case, model)
+    fld = load_field(frames, var_name, vm[0] if vm else None, body, same)
+    fluid = build_fluid_mask(fld, model.fluid_stl, same)
     if not fluid.any():
         fail("fluid mask is empty")
 
-    if HAS_IMPELLER:
-        impeller = detect_impeller_zone(fld, fluid, model, args.impeller_pad,
-                                        args.impeller_percentile, args.impeller_shape)
-    else:
+    if not HAS_IMPELLER:
         impeller = np.zeros(fld.var.shape, bool)
         log("impeller zone disabled; all zones from clustering")
+    elif same and same.get("fluid") is fluid and "impeller" in same:
+        impeller = same["impeller"]
+        log(f"impeller zone: reused from the previous variable, {np.count_nonzero(impeller):,} cells")
+    else:
+        impeller = detect_impeller_zone(fld, fluid, model, args.impeller_pad,
+                                        args.impeller_percentile, args.impeller_shape)
+        if same is not None and same.get("fluid") is fluid:
+            same["impeller"] = impeller
 
     # --- cluster the remainder
     n_classes = None
@@ -1269,6 +1909,10 @@ def run_case(case: Case, model: ModelInfo, variable: str, args, out_dir: Path) -
     cell_vol = float(np.prod(fld.spacing))
     class_means = {int(c): float(fld.var[zone_class == c].mean())
                    for c in np.unique(zone_class) if c >= 1}
+    # upper boundary of each value class: none for the impeller zone and the top class
+    class_upper = {c: (float(bounds[c - class_offset - 1])
+                       if 0 < c - class_offset <= len(bounds) else None) for c in class_means}
+    center = view_center(model, fld.cell_centers_1d(), zone_class)
     rows = collect_zone_rows(zone_class, zone_id, fluid, fld.var, cell_vol)
     report(rows, fld.var_name, out_dir / "zones.csv")
     het = heterogeneity_stats(fld, fluid, zone_class, model,
@@ -1286,9 +1930,14 @@ def run_case(case: Case, model: ModelInfo, variable: str, args, out_dir: Path) -
     report_heterogeneity(het, fld.var_name, out_dir / "heterogeneity.csv",
                          args.eta2_threshold, args.contrast_threshold)
     write_labeled_vti(fld, zone_class, zone_id, out_dir / "zones.vti")
+    write_data_csvs(out_dir, fld, fluid, zone_class, class_upper, trace, t_steady, t_sel,
+                    model.impeller_axis, class_means)
+    write_zone_slices(out_dir, fld, zone_class, model.impeller_axis, center)
+    write_zoner_summary(out_dir, case.root.name, variable, fld, het, class_means, t_sel, t_steady,
+                        t_avg, len(frames))
     if not args.no_plots:
-        make_plots(out_dir, fld, fluid, zone_class, bounds, trace, t_steady, t_sel,
-                   model.impeller_axis, class_means)
+        make_plots(out_dir, fld, fluid, zone_class, class_upper, trace, t_steady, t_sel,
+                   model.impeller_axis, class_means, center)
     if not args.no_render:
         render_3d(out_dir, fld, zone_class, model, show=args.show, html=args.html,
                   class_means=class_means)
@@ -1440,13 +2089,14 @@ def zone_slice_2d(r: CaseResult):
     xc, yc, zc = (o[j] + (np.arange(nc[j]) + 0.5) * sp[j] for j in range(3))
     u = (np.abs(r.model.impeller_axis) if r.model.impeller_axis is not None
          else np.array([0.0, 1.0, 0.0]))
-    if u[2] < 0.9:  # y-up tank: slice normal to z through z=0 (not the grid mid-index)
-        k = int(np.argmin(np.abs(zc)))
+    c = view_center(r.model, (xc, yc, zc), zone_class)
+    if u[2] < 0.9:  # y-up tank: slice normal to z through the axis (not the grid mid-index)
+        k = int(np.argmin(np.abs(zc - c[2])))
         img = zone_class[k, :, :]
         extent = [xc[0], xc[-1], yc[0], yc[-1]]
         xl, yl = "x [m]", "y [m]"
-    else:  # z-up tank: slice normal to y through y=0
-        k = int(np.argmin(np.abs(yc)))
+    else:  # z-up tank: slice normal to y through the axis
+        k = int(np.argmin(np.abs(yc - c[1])))
         img = zone_class[:, k, :]
         extent = [xc[0], xc[-1], zc[0], zc[-1]]
         xl, yl = "x [m]", "z [m]"
@@ -1766,7 +2416,7 @@ def batch_html_3d(results: list[CaseResult], out_path: Path) -> None:
                         label=zone_label(c, r.class_means, unit))
         if r.model.impeller_stl is not None:
             try:
-                pl.add_mesh(pv.read(str(r.model.impeller_stl)), color="dimgray")
+                pl.add_mesh(load_impeller(r.model), color="dimgray")
             except Exception:
                 pass
         pl.add_text(r.case_name, font_size=10)
@@ -1785,8 +2435,7 @@ def batch_html_3d(results: list[CaseResult], out_path: Path) -> None:
             pl.add_mesh(txt, color="black")
         except Exception:
             pass
-        up = (tuple(np.abs(r.model.impeller_axis))
-              if r.model.impeller_axis is not None else (0, 1, 0))
+        up = tuple(up_axis(r.model.impeller_axis))
         pl.view_vector((1.0, 0.6, 1.0), viewup=up)
         pl.reset_camera(bounds=grid.bounds)
     try:
@@ -1877,6 +2526,7 @@ def run_batch(args) -> None:
             f"t = {case.vti_series[0][0]:.3g} .. {case.vti_series[-1][0]:.3g} s")
         model = parse_input_xml(case.input_xml, case.stl_files)
         base = (args.output_dir / case.root.name) if args.output_dir else case.root / "zoner_output"
+        shared = {} if len(args.variable) > 1 else None
         for v in args.variable:
             out_dir = case_out_dir(base, args.variable, v)
             try:
@@ -1892,7 +2542,7 @@ def run_batch(args) -> None:
                     else:
                         results[v].append(r)
                 else:
-                    results[v].append(run_case(case, model, v, args, out_dir))
+                    results[v].append(run_case(case, model, v, args, out_dir, shared))
             except (Exception, SystemExit) as e:  # keep the batch alive on bad cases
                 warn(f"case '{case.root.name}', variable '{v}' failed: {e}")
 
@@ -1929,14 +2579,20 @@ def main(argv=None):
     ap.add_argument("--n-zones", type=int, default=None,
                     help="total zones incl. impeller; omit for automatic selection")
     ap.add_argument("--time", type=float, default=None,
-                    help="analysis time [s]; overrides steady-state detection")
+                    help="start of the averaging window [s] (frames from this time to the "
+                         "last one are averaged); with --instantaneous the analysed frame "
+                         "is the first one at or after it; overrides steady-state "
+                         "detection; no effect on a Time-Avg array (last frame)")
     ap.add_argument("--steady-on", choices=["variable", "power"], default="variable",
                     help="steady-state criterion source")
     ap.add_argument("--tol", type=float, default=0.02,
                     help="steady-state tolerance on windowed-mean drift")
     ap.add_argument("--window", type=float, default=1.0, help="steady-state window [s]")
     ap.add_argument("--instantaneous", action="store_true",
-                    help="use instantaneous field even if a Time-Avg variant exists")
+                    help="analyse one instantaneous frame (the first at or after the steady "
+                         "start or --time) instead of the Time-Avg array of the last frame "
+                         "or, without a Time-Avg variant, the average over all frames from "
+                         "the steady start on")
     ap.add_argument("--linear", action="store_true",
                     help="cluster on linear values, not log-transformed")
     ap.add_argument("--log-base", type=float, default=10.0,
@@ -2002,10 +2658,11 @@ def main(argv=None):
 
     model = parse_input_xml(case.input_xml, case.stl_files)
     base = args.output_dir or (args.case if args.case.is_dir() else args.case.parent) / "zoner_output"
+    shared = {} if len(args.variable) > 1 else None  # what the variables have in common
     for v in args.variable:
         if len(args.variable) > 1:
             log(f"--- variable: {v} ---")
-        run_case(case, model, v, args, case_out_dir(base, args.variable, v))
+        run_case(case, model, v, args, case_out_dir(base, args.variable, v), shared)
     log("done")
 
 
